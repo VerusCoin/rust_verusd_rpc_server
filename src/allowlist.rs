@@ -67,6 +67,7 @@ pub fn is_method_allowed(method: &str, params: &[Box<RawValue>]) -> bool {
         "getchaintips" => check_params(params, &[]),
         "getcurrency" => check_params(params, &["str"]),
         "getcurrencyconverters" => check_params(params, &["str", "str", "str"]),
+        "getcurrencystate" => check_params(params, &["str","int"]),
         "getcurrencytrust" => check_params(params, &["arr"]),
         "getdifficulty" => check_params(params, &[]),
         "getexports" => check_params(params, &["str", "int", "int"]),
