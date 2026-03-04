@@ -1,6 +1,4 @@
-rpc_url = "RPC_URL:PORT"
-rpc_user = "RPC_USER"
-rpc_password = "RPC_PASSWORD"
-
-server_port = SERVER_PORT
-server_addr = "ADDRESS_TO_BIND_TO"
+tls_enabled = false
+rpc_url = "127.0.0.1:18843"
+server_port = 8000
+server_addr = "127.0.0.1"
