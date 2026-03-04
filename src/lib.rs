@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex};
 use tokio::time::{timeout, Duration};
 
 pub mod allowlist;
+pub mod auth;
+use auth::AuthState;
 
 const READ_TIMEOUT_SECS: Duration = Duration::from_secs(5);
 // 1 MiB — sufficient for any JSON-RPC payload on this API surface.
@@ -91,19 +93,23 @@ pub async fn read_body_limited(mut body: Body, limit: usize) -> Result<Vec<u8>, 
     Ok(buf)
 }
 
-pub async fn handle_req(req: Request<Body>, rpc: Arc<VerusRPC>) -> Result<Response<Body>, hyper::Error> {
+pub async fn handle_req(req: Request<Body>, rpc: Arc<VerusRPC>, auth: Option<Arc<AuthState>>) -> Result<Response<Body>, hyper::Error> {
+    // Split early so headers remain accessible after the body is consumed.
+    let (parts, body) = req.into_parts();
 
     // Handle CORS preflight (OPTIONS) request
-    if req.method() == hyper::Method::OPTIONS {
+    if parts.method == hyper::Method::OPTIONS {
         let mut response = Response::new(Body::empty());
         response.headers_mut().insert(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
         response.headers_mut().insert(hyper::header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST".parse().unwrap());
-        response.headers_mut().insert(hyper::header::ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type, Authorization, Accept".parse().unwrap());
+        response.headers_mut().insert(hyper::header::ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type, Authorization, Accept, X-App-ID, X-Timestamp, X-Auth-Token".parse().unwrap());
         response.headers_mut().insert(hyper::header::ACCESS_CONTROL_MAX_AGE, "3600".parse().unwrap());
         return Ok(response);
     }
 
-    let whole_body = match timeout(READ_TIMEOUT_SECS, read_body_limited(req.into_body(), MAX_BODY_BYTES)).await {
+    // CRIT-1 fix: size is enforced during accumulation inside read_body_limited,
+    // so a missing or lying Content-Length header cannot bypass the limit.
+    let whole_body = match timeout(READ_TIMEOUT_SECS, read_body_limited(body, MAX_BODY_BYTES)).await {
         Ok(Ok(b)) => b,
         Ok(Err(ReadBodyError::TooLarge)) => {
             return Ok(Response::builder()
@@ -136,11 +142,38 @@ pub async fn handle_req(req: Request<Body>, rpc: Arc<VerusRPC>) -> Result<Respon
     };
 
     let json_body: Result<Value, _> = serde_json::from_str(&str_body);
+
+    // Auth gate: checked after JSON parsing so the method name is available.
+    if let Some(auth_state) = &auth {
+        let method = json_body.as_ref().ok()
+            .and_then(|v| v["method"].as_str())
+            .unwrap_or("");
+        let app_id = parts.headers.get("x-app-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let timestamp: i64 = parts.headers.get("x-timestamp")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let token = parts.headers.get("x-auth-token")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        if !auth_state.check_token(token, method, timestamp, app_id) {
+            let mut response = Response::builder()
+                .status(hyper::StatusCode::UNAUTHORIZED)
+                .body(Body::from(json!({"error": {"code": -32600, "message": "Unauthorized"}}).to_string()))
+                .unwrap();
+            response.headers_mut().insert(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
+            return Ok(response);
+        }
+    }
+
     let result = match json_body {
         Ok(req_body) => rpc.handle(req_body),
         Err(_) => Err(RpcError { code: -32700, message: "Parse error".into(), data: None }),
     };
-    // Process the CORS headers
+
     let mut response = match result {
         Ok(res) => Response::new(Body::from(json!({"result": res}).to_string())),
         Err(err) => Response::new(Body::from(json!({"error": { "code": err.code, "message": err.message }}).to_string())),
@@ -149,7 +182,7 @@ pub async fn handle_req(req: Request<Body>, rpc: Arc<VerusRPC>) -> Result<Respon
     // Add CORS headers
     response.headers_mut().insert(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
     response.headers_mut().insert(hyper::header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, PUT, OPTIONS, POST".parse().unwrap());
-    response.headers_mut().insert(hyper::header::ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type, Authorization, Accept".parse().unwrap());
+    response.headers_mut().insert(hyper::header::ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type, Authorization, Accept, X-App-ID, X-Timestamp, X-Auth-Token".parse().unwrap());
     response.headers_mut().insert(hyper::header::ACCESS_CONTROL_MAX_AGE, "3600".parse().unwrap());
 
     // Set the Referrer Policy header

@@ -12,6 +12,7 @@ config = "0.13"
 rustls = "0.21"
 rustls-pemfile = "1"
 tokio-rustls = "0.24"
+blake2b_simd = "1"
 
 [dev-dependencies]
 rcgen = "0.11"

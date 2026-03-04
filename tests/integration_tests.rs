@@ -1,6 +1,7 @@
 use rust_verusd_rpc_server::{VerusRPC, handle_req, read_body_limited, ReadBodyError, load_tls_config, MAX_BODY_BYTES};
+use rust_verusd_rpc_server::auth::{AuthState, compute_token};
 use hyper::{Body, Request, StatusCode, server::conn::Http, service::service_fn};
-use std::{net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
 use tokio::net::TcpListener;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -19,7 +20,7 @@ fn dummy_rpc() -> Arc<VerusRPC> {
 }
 
 /// Spawn a plain-HTTP test server on an OS-assigned port; returns its address.
-async fn spawn_plain_server(rpc: Arc<VerusRPC>) -> SocketAddr {
+async fn spawn_plain_server(rpc: Arc<VerusRPC>, auth: Option<Arc<AuthState>>) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -27,9 +28,10 @@ async fn spawn_plain_server(rpc: Arc<VerusRPC>) -> SocketAddr {
             match listener.accept().await {
                 Ok((tcp, _)) => {
                     let rpc = rpc.clone();
+                    let auth = auth.clone();
                     tokio::spawn(async move {
                         let _ = Http::new()
-                            .serve_connection(tcp, service_fn(move |req| handle_req(req, rpc.clone())))
+                            .serve_connection(tcp, service_fn(move |req| handle_req(req, rpc.clone(), auth.clone())))
                             .await;
                     });
                 }
@@ -38,6 +40,31 @@ async fn spawn_plain_server(rpc: Arc<VerusRPC>) -> SocketAddr {
         }
     });
     addr
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+}
+
+fn make_auth(app_id: &str, api_key: &str) -> Arc<AuthState> {
+    let mut keys = HashMap::new();
+    keys.insert(app_id.to_string(), api_key.to_string());
+    Arc::new(AuthState::new(keys))
+}
+
+async fn post_with_auth(addr: SocketAddr, json: &str, app_id: &str, api_key: &str, method: &str, time: i64) -> hyper::Response<Body> {
+    let token = compute_token(api_key, method, time, app_id);
+    hyper::Client::new()
+        .request(
+            Request::post(format!("http://{}", addr))
+                .header("x-app-id", app_id)
+                .header("x-timestamp", time.to_string())
+                .header("x-auth-token", token)
+                .body(Body::from(json.to_string()))
+                .unwrap()
+        )
+        .await
+        .unwrap()
 }
 
 async fn post(addr: SocketAddr, body: Body) -> hyper::Response<Body> {
@@ -100,7 +127,7 @@ async fn body_limit_multi_chunk_accumulation_rejected() {
 
 #[tokio::test]
 async fn http_oversized_body_no_content_length_returns_413() {
-    let addr = spawn_plain_server(dummy_rpc()).await;
+    let addr = spawn_plain_server(dummy_rpc(), None).await;
 
     // Body::channel() produces chunked transfer encoding with no Content-Length.
     let (mut sender, body) = Body::channel();
@@ -120,7 +147,7 @@ async fn http_oversized_body_no_content_length_returns_413() {
 /// Sanity-check: an oversized body that does set Content-Length is also rejected.
 #[tokio::test]
 async fn http_oversized_body_with_content_length_returns_413() {
-    let addr = spawn_plain_server(dummy_rpc()).await;
+    let addr = spawn_plain_server(dummy_rpc(), None).await;
     let resp = post(addr, Body::from(vec![b'x'; MAX_BODY_BYTES + 1])).await;
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
@@ -133,7 +160,7 @@ async fn http_lying_content_length_oversized_body_rejected() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
-    let addr = spawn_plain_server(dummy_rpc()).await;
+    let addr = spawn_plain_server(dummy_rpc(), None).await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
 
     // Content-Length: 100 (lies — under limit); Transfer-Encoding: chunked wins.
@@ -165,7 +192,7 @@ async fn http_lying_content_length_oversized_body_rejected() {
 /// A body under the limit sent without Content-Length must be accepted.
 #[tokio::test]
 async fn http_body_under_limit_no_content_length_accepted() {
-    let addr = spawn_plain_server(dummy_rpc()).await;
+    let addr = spawn_plain_server(dummy_rpc(), None).await;
     let (mut sender, body) = Body::channel();
     tokio::spawn(async move {
         let _ = sender.send_data(b"{\"method\":\"getinfo\",\"params\":[]}".to_vec().into()).await;
@@ -180,7 +207,7 @@ async fn http_body_under_limit_no_content_length_accepted() {
 
 #[tokio::test]
 async fn options_returns_200_with_cors_headers() {
-    let addr = spawn_plain_server(dummy_rpc()).await;
+    let addr = spawn_plain_server(dummy_rpc(), None).await;
     let resp = hyper::Client::new()
         .request(Request::options(format!("http://{}", addr)).body(Body::empty()).unwrap())
         .await
@@ -194,7 +221,7 @@ async fn options_returns_200_with_cors_headers() {
 
 #[tokio::test]
 async fn post_response_includes_cors_origin_header() {
-    let addr = spawn_plain_server(dummy_rpc()).await;
+    let addr = spawn_plain_server(dummy_rpc(), None).await;
     let resp = post_json(addr, "{\"method\":\"getinfo\",\"params\":[]}").await;
     assert_eq!(resp.headers()["access-control-allow-origin"], "*");
 }
@@ -203,14 +230,14 @@ async fn post_response_includes_cors_origin_header() {
 
 #[tokio::test]
 async fn invalid_utf8_body_returns_400() {
-    let addr = spawn_plain_server(dummy_rpc()).await;
+    let addr = spawn_plain_server(dummy_rpc(), None).await;
     let resp = post(addr, Body::from(vec![0xff, 0xfe, 0x00])).await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
 async fn invalid_json_returns_parse_error_code() {
-    let addr = spawn_plain_server(dummy_rpc()).await;
+    let addr = spawn_plain_server(dummy_rpc(), None).await;
     let resp = post_json(addr, "not json at all {{").await;
     assert_eq!(resp.status(), StatusCode::OK); // JSON-RPC errors are 200 per spec
     let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
@@ -219,7 +246,7 @@ async fn invalid_json_returns_parse_error_code() {
 
 #[tokio::test]
 async fn missing_method_field_returns_invalid_params() {
-    let addr = spawn_plain_server(dummy_rpc()).await;
+    let addr = spawn_plain_server(dummy_rpc(), None).await;
     let resp = post_json(addr, "{\"params\":[]}").await;
     let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(v["error"]["code"], -32602);
@@ -227,7 +254,7 @@ async fn missing_method_field_returns_invalid_params() {
 
 #[tokio::test]
 async fn missing_params_field_returns_invalid_params() {
-    let addr = spawn_plain_server(dummy_rpc()).await;
+    let addr = spawn_plain_server(dummy_rpc(), None).await;
     let resp = post_json(addr, "{\"method\":\"getinfo\"}").await;
     let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(v["error"]["code"], -32602);
@@ -237,7 +264,7 @@ async fn missing_params_field_returns_invalid_params() {
 
 #[tokio::test]
 async fn unlisted_method_returns_method_not_found() {
-    let addr = spawn_plain_server(dummy_rpc()).await;
+    let addr = spawn_plain_server(dummy_rpc(), None).await;
     for method in &["getbalance", "listaccounts", "dumpprivkey", "importprivkey", "stop"] {
         let payload = format!("{{\"method\":\"{}\",\"params\":[]}}", method);
         let resp = post_json(addr, &payload).await;
@@ -248,7 +275,7 @@ async fn unlisted_method_returns_method_not_found() {
 
 #[tokio::test]
 async fn allowed_method_wrong_param_types_blocked() {
-    let addr = spawn_plain_server(dummy_rpc()).await;
+    let addr = spawn_plain_server(dummy_rpc(), None).await;
     // getinfo takes no params; sending one fails allowlist
     let resp = post_json(addr, "{\"method\":\"getinfo\",\"params\":[\"unexpected\"]}").await;
     let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
@@ -259,7 +286,7 @@ async fn allowed_method_wrong_param_types_blocked() {
 async fn allowed_method_correct_params_reaches_rpc_backend() {
     // getinfo passes the allowlist. The dummy backend is not running, so we get
     // a -32603 internal error — NOT a -32601 method-not-found.
-    let addr = spawn_plain_server(dummy_rpc()).await;
+    let addr = spawn_plain_server(dummy_rpc(), None).await;
     let resp = post_json(addr, "{\"method\":\"getinfo\",\"params\":[]}").await;
     assert_eq!(resp.status(), StatusCode::OK);
     let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
@@ -268,7 +295,7 @@ async fn allowed_method_correct_params_reaches_rpc_backend() {
 
 #[tokio::test]
 async fn sendcurrency_without_simulation_flag_blocked() {
-    let addr = spawn_plain_server(dummy_rpc()).await;
+    let addr = spawn_plain_server(dummy_rpc(), None).await;
     let resp = post_json(addr, r#"{"method":"sendcurrency","params":["*",[],0,0.001,false]}"#).await;
     let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(v["error"]["code"], -32601);
@@ -276,7 +303,7 @@ async fn sendcurrency_without_simulation_flag_blocked() {
 
 #[tokio::test]
 async fn sendcurrency_with_simulation_flag_passes_allowlist() {
-    let addr = spawn_plain_server(dummy_rpc()).await;
+    let addr = spawn_plain_server(dummy_rpc(), None).await;
     let resp = post_json(addr, r#"{"method":"sendcurrency","params":["*",[],0,0.001,true]}"#).await;
     let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_ne!(v["error"]["code"], -32601);
@@ -284,7 +311,7 @@ async fn sendcurrency_with_simulation_flag_passes_allowlist() {
 
 #[tokio::test]
 async fn signdata_with_address_field_blocked() {
-    let addr = spawn_plain_server(dummy_rpc()).await;
+    let addr = spawn_plain_server(dummy_rpc(), None).await;
     let resp = post_json(addr, r#"{"method":"signdata","params":[{"address":"R1","data":"aa"}]}"#).await;
     let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(v["error"]["code"], -32601);
@@ -292,7 +319,7 @@ async fn signdata_with_address_field_blocked() {
 
 #[tokio::test]
 async fn signdata_without_address_passes_allowlist() {
-    let addr = spawn_plain_server(dummy_rpc()).await;
+    let addr = spawn_plain_server(dummy_rpc(), None).await;
     let resp = post_json(addr, r#"{"method":"signdata","params":[{"data":"aabbcc"}]}"#).await;
     let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_ne!(v["error"]["code"], -32601);
@@ -304,7 +331,7 @@ async fn signdata_without_address_passes_allowlist() {
 /// or connection exhaustion if the old per-connection VerusRPC bug were present.
 #[tokio::test]
 async fn concurrent_requests_all_complete_successfully() {
-    let addr = spawn_plain_server(dummy_rpc()).await;
+    let addr = spawn_plain_server(dummy_rpc(), None).await;
     let handles: Vec<_> = (0..20)
         .map(|_| tokio::spawn(async move {
             post_json(addr, "{\"method\":\"getinfo\",\"params\":[]}").await
@@ -387,7 +414,7 @@ async fn tls_server_accepts_https_connection_and_returns_rpc_response() {
         if let Ok((tcp, _)) = listener.accept().await {
             if let Ok(tls) = acceptor.accept(tcp).await {
                 let _ = Http::new()
-                    .serve_connection(tls, service_fn(move |req| handle_req(req, rpc.clone())))
+                    .serve_connection(tls, service_fn(move |req| handle_req(req, rpc.clone(), None)))
                     .await;
             }
         }
@@ -426,4 +453,113 @@ async fn tls_server_accepts_https_connection_and_returns_rpc_response() {
     if let Some(code) = v["error"]["code"].as_i64() {
         assert_ne!(code, -32601, "getinfo should be allowlisted");
     }
+}
+
+// ── API key authentication ─────────────────────────────────────────────────────
+
+/// Correct token → auth passes and request reaches the RPC backend (not 401).
+#[tokio::test]
+async fn auth_valid_token_passes() {
+    let addr = spawn_plain_server(dummy_rpc(), Some(make_auth("app1", "secret"))).await;
+    let time = now_ms();
+    let resp = post_with_auth(addr, r#"{"method":"getinfo","params":[]}"#, "app1", "secret", "getinfo", time).await;
+    assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Missing all auth headers → 401.
+#[tokio::test]
+async fn auth_missing_headers_returns_401() {
+    let addr = spawn_plain_server(dummy_rpc(), Some(make_auth("app1", "secret"))).await;
+    let resp = post_json(addr, r#"{"method":"getinfo","params":[]}"#).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Unknown app_id (not in the key map) → 401.
+#[tokio::test]
+async fn auth_unknown_app_id_returns_401() {
+    let addr = spawn_plain_server(dummy_rpc(), Some(make_auth("app1", "secret"))).await;
+    let time = now_ms();
+    // Token computed with the unknown app_id's (non-existent) key
+    let resp = post_with_auth(addr, r#"{"method":"getinfo","params":[]}"#, "unknown", "anything", "getinfo", time).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Correct app_id but wrong token value → 401.
+#[tokio::test]
+async fn auth_wrong_token_returns_401() {
+    let addr = spawn_plain_server(dummy_rpc(), Some(make_auth("app1", "secret"))).await;
+    let time = now_ms();
+    hyper::Client::new()
+        .request(
+            Request::post(format!("http://{}", addr))
+                .header("x-app-id", "app1")
+                .header("x-timestamp", time.to_string())
+                .header("x-auth-token", "not-the-right-token")
+                .body(Body::from(r#"{"method":"getinfo","params":[]}"#))
+                .unwrap()
+        )
+        .await
+        .map(|r| assert_eq!(r.status(), StatusCode::UNAUTHORIZED))
+        .unwrap();
+}
+
+/// Token was computed for a different method → 401 (method is part of the hash).
+#[tokio::test]
+async fn auth_token_for_wrong_method_returns_401() {
+    let addr = spawn_plain_server(dummy_rpc(), Some(make_auth("app1", "secret"))).await;
+    let time = now_ms();
+    // Token signed for "getblock" but request calls "getinfo"
+    let token = compute_token("secret", "getblock", time, "app1");
+    hyper::Client::new()
+        .request(
+            Request::post(format!("http://{}", addr))
+                .header("x-app-id", "app1")
+                .header("x-timestamp", time.to_string())
+                .header("x-auth-token", token)
+                .body(Body::from(r#"{"method":"getinfo","params":[]}"#))
+                .unwrap()
+        )
+        .await
+        .map(|r| assert_eq!(r.status(), StatusCode::UNAUTHORIZED))
+        .unwrap();
+}
+
+/// Timestamp more than 10 minutes in the past → 401.
+#[tokio::test]
+async fn auth_expired_timestamp_returns_401() {
+    let addr = spawn_plain_server(dummy_rpc(), Some(make_auth("app1", "secret"))).await;
+    let time = now_ms() - 601_000; // 10 min 1 sec ago
+    let resp = post_with_auth(addr, r#"{"method":"getinfo","params":[]}"#, "app1", "secret", "getinfo", time).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Timestamp more than 10 minutes in the future → 401 (clock-skew guard).
+#[tokio::test]
+async fn auth_far_future_timestamp_returns_401() {
+    let addr = spawn_plain_server(dummy_rpc(), Some(make_auth("app1", "secret"))).await;
+    let time = now_ms() + 601_000;
+    let resp = post_with_auth(addr, r#"{"method":"getinfo","params":[]}"#, "app1", "secret", "getinfo", time).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Replay attack: same (app_id, timestamp) used twice → second request → 401.
+#[tokio::test]
+async fn auth_replay_attack_returns_401() {
+    let auth = make_auth("app1", "secret");
+    let addr = spawn_plain_server(dummy_rpc(), Some(auth)).await;
+    let time = now_ms();
+
+    let r1 = post_with_auth(addr, r#"{"method":"getinfo","params":[]}"#, "app1", "secret", "getinfo", time).await;
+    assert_ne!(r1.status(), StatusCode::UNAUTHORIZED, "first request should pass");
+
+    let r2 = post_with_auth(addr, r#"{"method":"getinfo","params":[]}"#, "app1", "secret", "getinfo", time).await;
+    assert_eq!(r2.status(), StatusCode::UNAUTHORIZED, "replayed timestamp should be rejected");
+}
+
+/// When auth is disabled (None), requests with no auth headers pass normally.
+#[tokio::test]
+async fn auth_disabled_no_headers_needed() {
+    let addr = spawn_plain_server(dummy_rpc(), None).await;
+    let resp = post_json(addr, r#"{"method":"getinfo","params":[]}"#).await;
+    assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
 }

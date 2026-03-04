@@ -1,6 +1,7 @@
 use rust_verusd_rpc_server::{VerusRPC, handle_req, load_tls_config};
+use rust_verusd_rpc_server::auth::AuthState;
 use hyper::{server::conn::Http, service::service_fn};
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tokio::net::TcpListener;
 
 #[tokio::main]
@@ -23,6 +24,17 @@ async fn main() {
     let server_addr = settings.get_string("server_addr").expect("Failed to read 'server_addr' from configuration");
 
     let rpc = Arc::new(VerusRPC::new(&url, &user, &password).unwrap());
+
+    // Load optional [api_keys] table from Secrets. If absent or empty, auth is disabled.
+    let api_keys: HashMap<String, String> = secrets
+        .get::<HashMap<String, String>>("api_keys")
+        .unwrap_or_default();
+    let auth: Option<Arc<AuthState>> = if api_keys.is_empty() {
+        None
+    } else {
+        eprintln!("API key authentication enabled ({} app(s) configured).", api_keys.len());
+        Some(Arc::new(AuthState::new(api_keys)))
+    };
 
     let addr: std::net::SocketAddr = (
         server_addr.parse::<std::net::IpAddr>().expect("Invalid server_addr in configuration"),
@@ -49,11 +61,12 @@ async fn main() {
                 Ok((tcp, _)) => {
                     let acceptor = acceptor.clone();
                     let rpc = rpc.clone();
+                    let auth = auth.clone();
                     tokio::spawn(async move {
                         match acceptor.accept(tcp).await {
                             Ok(tls) => {
                                 if let Err(e) = Http::new()
-                                    .serve_connection(tls, service_fn(move |req| handle_req(req, rpc.clone())))
+                                    .serve_connection(tls, service_fn(move |req| handle_req(req, rpc.clone(), auth.clone())))
                                     .await
                                 {
                                     eprintln!("Connection error: {}", e);
@@ -72,9 +85,10 @@ async fn main() {
             match listener.accept().await {
                 Ok((tcp, _)) => {
                     let rpc = rpc.clone();
+                    let auth = auth.clone();
                     tokio::spawn(async move {
                         if let Err(e) = Http::new()
-                            .serve_connection(tcp, service_fn(move |req| handle_req(req, rpc.clone())))
+                            .serve_connection(tcp, service_fn(move |req| handle_req(req, rpc.clone(), auth.clone())))
                             .await
                         {
                             eprintln!("Connection error: {}", e);
