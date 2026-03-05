@@ -16,9 +16,9 @@ impl AuthState {
     }
 
     /// Returns true iff `validity_key` is the correct BLAKE2b-512 token for this
-    /// (app_id, method, time) tuple, the timestamp is within 10 minutes of now,
+    /// (app_id, body, time, version) tuple, the timestamp is within 10 minutes of now,
     /// and the timestamp has not been seen before (replay guard).
-    pub fn check_token(&self, validity_key: &str, method: &str, time: i64, app_id: &str) -> bool {
+    pub fn check_token(&self, validity_key: &str, body: &str, time: i64, app_id: &str, version: &str) -> bool {
         let api_key = match self.api_keys.get(app_id) {
             Some(k) => k,
             None => return false,
@@ -43,22 +43,22 @@ impl AuthState {
             seen.retain(|&t| (now_ms - t).abs() < 600_000);
         }
 
-        compute_token(api_key, method, time, app_id) == validity_key
+        compute_token(api_key, body, time, app_id, version) == validity_key
     }
 }
 
 /// Computes the BLAKE2b-512 token used to authenticate a request.
 ///
-/// Hash input (in order): time-as-decimal-string | api_key | method | app_id.
+/// Hash input (in order): time-as-decimal-string | api_key | request-body | app_id | api-version.
 /// The output is the 128-character lowercase hex digest.
-pub fn compute_token(api_key: &str, method: &str, time: i64, app_id: &str) -> String {
+pub fn compute_token(api_key: &str, body: &str, time: i64, app_id: &str, version: &str) -> String {
     let mut state = blake2b_simd::Params::new()
         .hash_length(64)
         .to_state();
     state.update(time.to_string().as_bytes());
     state.update(api_key.as_bytes());
-    state.update(method.as_bytes());
+    state.update(body.as_bytes());
     state.update(app_id.as_bytes());
-    let token = state.finalize().to_hex().to_string();
-    token
+    state.update(version.as_bytes());
+    state.finalize().to_hex().to_string()
 }

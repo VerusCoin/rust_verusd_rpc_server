@@ -52,14 +52,15 @@ fn make_auth(app_id: &str, api_key: &str) -> Arc<AuthState> {
     Arc::new(AuthState::new(keys))
 }
 
-async fn post_with_auth(addr: SocketAddr, json: &str, app_id: &str, api_key: &str, method: &str, time: i64) -> hyper::Response<Body> {
-    let token = compute_token(api_key, method, time, app_id);
+async fn post_with_auth(addr: SocketAddr, json: &str, app_id: &str, api_key: &str, time: i64) -> hyper::Response<Body> {
+    let token = compute_token(api_key, json, time, app_id, "2");
     hyper::Client::new()
         .request(
             Request::post(format!("http://{}", addr))
                 .header("x-app-id", app_id)
                 .header("x-timestamp", time.to_string())
                 .header("x-auth-token", token)
+                .header("x-vrpc-api-version", "2")
                 .body(Body::from(json.to_string()))
                 .unwrap()
         )
@@ -457,45 +458,54 @@ async fn tls_server_accepts_https_connection_and_returns_rpc_response() {
 
 // ── API key authentication ─────────────────────────────────────────────────────
 
+const BODY: &str = r#"{"method":"getinfo","params":[]}"#;
+
 /// Correct token → auth passes and request reaches the RPC backend (not 401).
 #[tokio::test]
 async fn auth_valid_token_passes() {
     let addr = spawn_plain_server(dummy_rpc(), Some(make_auth("app1", "secret"))).await;
-    let time = now_ms();
-    let resp = post_with_auth(addr, r#"{"method":"getinfo","params":[]}"#, "app1", "secret", "getinfo", time).await;
+    let resp = post_with_auth(addr, BODY, "app1", "secret", now_ms()).await;
     assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
-/// Missing all auth headers → 401.
+/// Missing version header → 400 (version check fires before token check).
 #[tokio::test]
-async fn auth_missing_headers_returns_401() {
+async fn auth_missing_version_returns_400() {
     let addr = spawn_plain_server(dummy_rpc(), Some(make_auth("app1", "secret"))).await;
-    let resp = post_json(addr, r#"{"method":"getinfo","params":[]}"#).await;
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let resp = post_json(addr, BODY).await; // no auth headers at all
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
-/// Unknown app_id (not in the key map) → 401.
+/// Wrong version number → 400.
 #[tokio::test]
-async fn auth_unknown_app_id_returns_401() {
+async fn auth_wrong_version_returns_400() {
     let addr = spawn_plain_server(dummy_rpc(), Some(make_auth("app1", "secret"))).await;
     let time = now_ms();
-    // Token computed with the unknown app_id's (non-existent) key
-    let resp = post_with_auth(addr, r#"{"method":"getinfo","params":[]}"#, "unknown", "anything", "getinfo", time).await;
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-}
-
-/// Correct app_id but wrong token value → 401.
-#[tokio::test]
-async fn auth_wrong_token_returns_401() {
-    let addr = spawn_plain_server(dummy_rpc(), Some(make_auth("app1", "secret"))).await;
-    let time = now_ms();
+    let token = compute_token("secret", BODY, time, "app1", "1");
     hyper::Client::new()
         .request(
             Request::post(format!("http://{}", addr))
                 .header("x-app-id", "app1")
                 .header("x-timestamp", time.to_string())
-                .header("x-auth-token", "not-the-right-token")
-                .body(Body::from(r#"{"method":"getinfo","params":[]}"#))
+                .header("x-auth-token", token)
+                .header("x-vrpc-api-version", "1") // wrong version
+                .body(Body::from(BODY))
+                .unwrap()
+        )
+        .await
+        .map(|r| assert_eq!(r.status(), StatusCode::BAD_REQUEST))
+        .unwrap();
+}
+
+/// Correct version but no other auth headers → 401.
+#[tokio::test]
+async fn auth_missing_auth_headers_returns_401() {
+    let addr = spawn_plain_server(dummy_rpc(), Some(make_auth("app1", "secret"))).await;
+    hyper::Client::new()
+        .request(
+            Request::post(format!("http://{}", addr))
+                .header("x-vrpc-api-version", "2")
+                .body(Body::from(BODY))
                 .unwrap()
         )
         .await
@@ -503,20 +513,50 @@ async fn auth_wrong_token_returns_401() {
         .unwrap();
 }
 
-/// Token was computed for a different method → 401 (method is part of the hash).
+/// Unknown app_id (not in the key map) → 401.
 #[tokio::test]
-async fn auth_token_for_wrong_method_returns_401() {
+async fn auth_unknown_app_id_returns_401() {
+    let addr = spawn_plain_server(dummy_rpc(), Some(make_auth("app1", "secret"))).await;
+    let resp = post_with_auth(addr, BODY, "unknown", "anything", now_ms()).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Correct app_id but wrong token value → 401.
+#[tokio::test]
+async fn auth_wrong_token_returns_401() {
+    let addr = spawn_plain_server(dummy_rpc(), Some(make_auth("app1", "secret"))).await;
+    hyper::Client::new()
+        .request(
+            Request::post(format!("http://{}", addr))
+                .header("x-app-id", "app1")
+                .header("x-timestamp", now_ms().to_string())
+                .header("x-auth-token", "not-the-right-token")
+                .header("x-vrpc-api-version", "2")
+                .body(Body::from(BODY))
+                .unwrap()
+        )
+        .await
+        .map(|r| assert_eq!(r.status(), StatusCode::UNAUTHORIZED))
+        .unwrap();
+}
+
+/// Token signed for body A but body B is sent (MITM parameter tampering) → 401.
+#[tokio::test]
+async fn auth_body_tampered_returns_401() {
     let addr = spawn_plain_server(dummy_rpc(), Some(make_auth("app1", "secret"))).await;
     let time = now_ms();
-    // Token signed for "getblock" but request calls "getinfo"
-    let token = compute_token("secret", "getblock", time, "app1");
+    let original_body = r#"{"method":"getinfo","params":[]}"#;
+    let tampered_body = r#"{"method":"sendcurrency","params":["*",[],0,0.001,true]}"#;
+    // Token is correct for original_body but the tampered body is sent instead.
+    let token = compute_token("secret", original_body, time, "app1", "2");
     hyper::Client::new()
         .request(
             Request::post(format!("http://{}", addr))
                 .header("x-app-id", "app1")
                 .header("x-timestamp", time.to_string())
                 .header("x-auth-token", token)
-                .body(Body::from(r#"{"method":"getinfo","params":[]}"#))
+                .header("x-vrpc-api-version", "2")
+                .body(Body::from(tampered_body))
                 .unwrap()
         )
         .await
@@ -528,8 +568,7 @@ async fn auth_token_for_wrong_method_returns_401() {
 #[tokio::test]
 async fn auth_expired_timestamp_returns_401() {
     let addr = spawn_plain_server(dummy_rpc(), Some(make_auth("app1", "secret"))).await;
-    let time = now_ms() - 601_000; // 10 min 1 sec ago
-    let resp = post_with_auth(addr, r#"{"method":"getinfo","params":[]}"#, "app1", "secret", "getinfo", time).await;
+    let resp = post_with_auth(addr, BODY, "app1", "secret", now_ms() - 601_000).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -537,8 +576,7 @@ async fn auth_expired_timestamp_returns_401() {
 #[tokio::test]
 async fn auth_far_future_timestamp_returns_401() {
     let addr = spawn_plain_server(dummy_rpc(), Some(make_auth("app1", "secret"))).await;
-    let time = now_ms() + 601_000;
-    let resp = post_with_auth(addr, r#"{"method":"getinfo","params":[]}"#, "app1", "secret", "getinfo", time).await;
+    let resp = post_with_auth(addr, BODY, "app1", "secret", now_ms() + 601_000).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -549,10 +587,10 @@ async fn auth_replay_attack_returns_401() {
     let addr = spawn_plain_server(dummy_rpc(), Some(auth)).await;
     let time = now_ms();
 
-    let r1 = post_with_auth(addr, r#"{"method":"getinfo","params":[]}"#, "app1", "secret", "getinfo", time).await;
+    let r1 = post_with_auth(addr, BODY, "app1", "secret", time).await;
     assert_ne!(r1.status(), StatusCode::UNAUTHORIZED, "first request should pass");
 
-    let r2 = post_with_auth(addr, r#"{"method":"getinfo","params":[]}"#, "app1", "secret", "getinfo", time).await;
+    let r2 = post_with_auth(addr, BODY, "app1", "secret", time).await;
     assert_eq!(r2.status(), StatusCode::UNAUTHORIZED, "replayed timestamp should be rejected");
 }
 
@@ -560,6 +598,6 @@ async fn auth_replay_attack_returns_401() {
 #[tokio::test]
 async fn auth_disabled_no_headers_needed() {
     let addr = spawn_plain_server(dummy_rpc(), None).await;
-    let resp = post_json(addr, r#"{"method":"getinfo","params":[]}"#).await;
+    let resp = post_json(addr, BODY).await;
     assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
 }
