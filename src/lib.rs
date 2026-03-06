@@ -102,7 +102,7 @@ pub async fn handle_req(req: Request<Body>, rpc: Arc<VerusRPC>, auth: Option<Arc
         let mut response = Response::new(Body::empty());
         response.headers_mut().insert(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
         response.headers_mut().insert(hyper::header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST".parse().unwrap());
-        response.headers_mut().insert(hyper::header::ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type, Authorization, Accept, X-App-ID, X-Timestamp, X-Auth-Token, X-VRPC-API-Version".parse().unwrap());
+        response.headers_mut().insert(hyper::header::ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type, Authorization, Accept, X-App-ID, X-Timestamp, X-Auth-Token, X-VRPC-API-Version, X-Salt".parse().unwrap());
         response.headers_mut().insert(hyper::header::ACCESS_CONTROL_MAX_AGE, "3600".parse().unwrap());
         return Ok(response);
     }
@@ -155,6 +155,17 @@ pub async fn handle_req(req: Request<Body>, rpc: Arc<VerusRPC>, auth: Option<Arc
             response.headers_mut().insert(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
             return Ok(response);
         }
+        let salt = parts.headers.get("x-salt")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if salt.len() != 64 || !salt.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            let mut response = Response::builder()
+                .status(hyper::StatusCode::BAD_REQUEST)
+                .body(Body::from(json!({"error": {"code": -32600, "message": "X-Salt must be exactly 64 lowercase hex characters (32 bytes)"}}).to_string()))
+                .unwrap();
+            response.headers_mut().insert(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
+            return Ok(response);
+        }
         let app_id = parts.headers.get("x-app-id")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
@@ -166,7 +177,7 @@ pub async fn handle_req(req: Request<Body>, rpc: Arc<VerusRPC>, auth: Option<Arc
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
 
-        if !auth_state.check_token(token, &str_body, timestamp, app_id, version) {
+        if !auth_state.check_token(token, &str_body, timestamp, app_id, version, salt) {
             let mut response = Response::builder()
                 .status(hyper::StatusCode::UNAUTHORIZED)
                 .body(Body::from(json!({"error": {"code": -32600, "message": "Unauthorized"}}).to_string()))
@@ -190,7 +201,7 @@ pub async fn handle_req(req: Request<Body>, rpc: Arc<VerusRPC>, auth: Option<Arc
     // Add CORS headers
     response.headers_mut().insert(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
     response.headers_mut().insert(hyper::header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, PUT, OPTIONS, POST".parse().unwrap());
-    response.headers_mut().insert(hyper::header::ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type, Authorization, Accept, X-App-ID, X-Timestamp, X-Auth-Token, X-VRPC-API-Version".parse().unwrap());
+    response.headers_mut().insert(hyper::header::ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type, Authorization, Accept, X-App-ID, X-Timestamp, X-Auth-Token, X-VRPC-API-Version, X-Salt".parse().unwrap());
     response.headers_mut().insert(hyper::header::ACCESS_CONTROL_MAX_AGE, "3600".parse().unwrap());
 
     // Set the Referrer Policy header

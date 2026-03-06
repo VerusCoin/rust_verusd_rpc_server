@@ -52,8 +52,23 @@ fn make_auth(app_id: &str, api_key: &str) -> Arc<AuthState> {
     Arc::new(AuthState::new(keys))
 }
 
-async fn post_with_auth(addr: SocketAddr, json: &str, app_id: &str, api_key: &str, time: i64) -> hyper::Response<Body> {
-    let token = compute_token(api_key, json, time, app_id, "2");
+/// Generates a pseudo-random 64-char hex salt (32 bytes) suitable for tests.
+fn random_salt() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CTR: AtomicU64 = AtomicU64::new(0);
+    let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+    let c = CTR.fetch_add(1, Ordering::Relaxed);
+    let mut s = t.wrapping_mul(6364136223846793005).wrapping_add(c.wrapping_mul(1442695040888963407));
+    let mut out = String::with_capacity(64);
+    for _ in 0..4 {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        out.push_str(&format!("{:016x}", s));
+    }
+    out
+}
+
+async fn post_with_auth_salted(addr: SocketAddr, json: &str, app_id: &str, api_key: &str, time: i64, salt: &str) -> hyper::Response<Body> {
+    let token = compute_token(api_key, json, time, app_id, "2", salt);
     hyper::Client::new()
         .request(
             Request::post(format!("http://{}", addr))
@@ -61,11 +76,16 @@ async fn post_with_auth(addr: SocketAddr, json: &str, app_id: &str, api_key: &st
                 .header("x-timestamp", time.to_string())
                 .header("x-auth-token", token)
                 .header("x-vrpc-api-version", "2")
+                .header("x-salt", salt)
                 .body(Body::from(json.to_string()))
                 .unwrap()
         )
         .await
         .unwrap()
+}
+
+async fn post_with_auth(addr: SocketAddr, json: &str, app_id: &str, api_key: &str, time: i64) -> hyper::Response<Body> {
+    post_with_auth_salted(addr, json, app_id, api_key, time, &random_salt()).await
 }
 
 async fn post(addr: SocketAddr, body: Body) -> hyper::Response<Body> {
@@ -468,7 +488,7 @@ async fn auth_valid_token_passes() {
     assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
-/// Missing version header → 400 (version check fires before token check).
+/// Missing version header → 400 (version check fires before salt/token checks).
 #[tokio::test]
 async fn auth_missing_version_returns_400() {
     let addr = spawn_plain_server(dummy_rpc(), Some(make_auth("app1", "secret"))).await;
@@ -481,7 +501,8 @@ async fn auth_missing_version_returns_400() {
 async fn auth_wrong_version_returns_400() {
     let addr = spawn_plain_server(dummy_rpc(), Some(make_auth("app1", "secret"))).await;
     let time = now_ms();
-    let token = compute_token("secret", BODY, time, "app1", "1");
+    let salt = random_salt();
+    let token = compute_token("secret", BODY, time, "app1", "1", &salt);
     hyper::Client::new()
         .request(
             Request::post(format!("http://{}", addr))
@@ -489,6 +510,7 @@ async fn auth_wrong_version_returns_400() {
                 .header("x-timestamp", time.to_string())
                 .header("x-auth-token", token)
                 .header("x-vrpc-api-version", "1") // wrong version
+                .header("x-salt", &salt)
                 .body(Body::from(BODY))
                 .unwrap()
         )
@@ -497,14 +519,37 @@ async fn auth_wrong_version_returns_400() {
         .unwrap();
 }
 
-/// Correct version but no other auth headers → 401.
+/// Missing or malformed salt → 400.
 #[tokio::test]
-async fn auth_missing_auth_headers_returns_401() {
+async fn auth_invalid_salt_returns_400() {
+    let addr = spawn_plain_server(dummy_rpc(), Some(make_auth("app1", "secret"))).await;
+    for bad_salt in &["", "tooshort", &"g".repeat(64), &"A".repeat(64)] { // not hex / wrong length / uppercase hex
+        hyper::Client::new()
+            .request(
+                Request::post(format!("http://{}", addr))
+                    .header("x-vrpc-api-version", "2")
+                    .header("x-salt", *bad_salt)
+                    .header("x-app-id", "app1")
+                    .header("x-timestamp", now_ms().to_string())
+                    .header("x-auth-token", "anytoken")
+                    .body(Body::from(BODY))
+                    .unwrap()
+            )
+            .await
+            .map(|r| assert_eq!(r.status(), StatusCode::BAD_REQUEST, "salt {:?} should be rejected", bad_salt))
+            .unwrap();
+    }
+}
+
+/// Correct version + valid salt but no other auth headers → 401.
+#[tokio::test]
+async fn auth_missing_token_headers_returns_401() {
     let addr = spawn_plain_server(dummy_rpc(), Some(make_auth("app1", "secret"))).await;
     hyper::Client::new()
         .request(
             Request::post(format!("http://{}", addr))
                 .header("x-vrpc-api-version", "2")
+                .header("x-salt", &random_salt())
                 .body(Body::from(BODY))
                 .unwrap()
         )
@@ -532,6 +577,7 @@ async fn auth_wrong_token_returns_401() {
                 .header("x-timestamp", now_ms().to_string())
                 .header("x-auth-token", "not-the-right-token")
                 .header("x-vrpc-api-version", "2")
+                .header("x-salt", &random_salt())
                 .body(Body::from(BODY))
                 .unwrap()
         )
@@ -545,10 +591,11 @@ async fn auth_wrong_token_returns_401() {
 async fn auth_body_tampered_returns_401() {
     let addr = spawn_plain_server(dummy_rpc(), Some(make_auth("app1", "secret"))).await;
     let time = now_ms();
+    let salt = random_salt();
     let original_body = r#"{"method":"getinfo","params":[]}"#;
     let tampered_body = r#"{"method":"sendcurrency","params":["*",[],0,0.001,true]}"#;
     // Token is correct for original_body but the tampered body is sent instead.
-    let token = compute_token("secret", original_body, time, "app1", "2");
+    let token = compute_token("secret", original_body, time, "app1", "2", &salt);
     hyper::Client::new()
         .request(
             Request::post(format!("http://{}", addr))
@@ -556,6 +603,7 @@ async fn auth_body_tampered_returns_401() {
                 .header("x-timestamp", time.to_string())
                 .header("x-auth-token", token)
                 .header("x-vrpc-api-version", "2")
+                .header("x-salt", &salt)
                 .body(Body::from(tampered_body))
                 .unwrap()
         )
@@ -580,18 +628,33 @@ async fn auth_far_future_timestamp_returns_401() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
-/// Replay attack: same (app_id, timestamp) used twice → second request → 401.
+/// Replay: same (time, salt) pair used twice → second request is rejected.
 #[tokio::test]
-async fn auth_replay_attack_returns_401() {
+async fn auth_replay_same_time_and_salt_rejected() {
+    let auth = make_auth("app1", "secret");
+    let addr = spawn_plain_server(dummy_rpc(), Some(auth)).await;
+    let time = now_ms();
+    let salt = random_salt(); // same salt for both requests
+
+    let r1 = post_with_auth_salted(addr, BODY, "app1", "secret", time, &salt).await;
+    assert_ne!(r1.status(), StatusCode::UNAUTHORIZED, "first request should pass");
+
+    let r2 = post_with_auth_salted(addr, BODY, "app1", "secret", time, &salt).await;
+    assert_eq!(r2.status(), StatusCode::UNAUTHORIZED, "replayed (time, salt) should be rejected");
+}
+
+/// Same timestamp with different salts → both requests pass (solves multi-client collision).
+#[tokio::test]
+async fn auth_same_time_different_salt_both_pass() {
     let auth = make_auth("app1", "secret");
     let addr = spawn_plain_server(dummy_rpc(), Some(auth)).await;
     let time = now_ms();
 
-    let r1 = post_with_auth(addr, BODY, "app1", "secret", time).await;
-    assert_ne!(r1.status(), StatusCode::UNAUTHORIZED, "first request should pass");
+    let r1 = post_with_auth_salted(addr, BODY, "app1", "secret", time, &"a".repeat(64)).await;
+    assert_ne!(r1.status(), StatusCode::UNAUTHORIZED, "first client should pass");
 
-    let r2 = post_with_auth(addr, BODY, "app1", "secret", time).await;
-    assert_eq!(r2.status(), StatusCode::UNAUTHORIZED, "replayed timestamp should be rejected");
+    let r2 = post_with_auth_salted(addr, BODY, "app1", "secret", time, &"b".repeat(64)).await;
+    assert_ne!(r2.status(), StatusCode::UNAUTHORIZED, "second client with same time but different salt should also pass");
 }
 
 /// When auth is disabled (None), requests with no auth headers pass normally.
