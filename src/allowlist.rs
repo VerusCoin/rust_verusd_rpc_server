@@ -124,7 +124,23 @@ pub fn is_method_allowed(method: &str, params: &[Box<RawValue>]) -> bool {
         "submitimports" => check_params(params, &["obj"]),
         "verifymessage" => check_params(params, &["str", "str", "str", "bool"]),
         "verifyhash" => check_params(params, &["str", "str", "str", "bool"]),
-        "verifysignature" => check_params(params, &["obj"]),
+        "verifysignature" => {
+            if params.len() > 1 {
+                return false;
+            }
+            if params.is_empty() {
+                return false;
+            }
+            if let Ok(value) = serde_json::from_str::<Value>(&params[0].to_string()) {
+                if let Value::Object(obj) = value {
+                    !obj.contains_key("filename")
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        }
         _ => false,
     }
 }

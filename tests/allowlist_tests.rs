@@ -301,3 +301,28 @@ fn verifymessage_str_str_str_allowed() {
 fn verifysignature_obj_allowed() {
     assert!(is_method_allowed("verifysignature", &[raw("{\"signature\":\"sig\"}")]));
 }
+
+#[test]
+fn verifysignature_obj_with_filename_blocked() {
+    assert!(!is_method_allowed("verifysignature", &[raw("{\"filename\":\"evil.txt\"}")]));
+}
+
+#[test]
+fn verifysignature_obj_with_filename_and_other_keys_blocked() {
+    assert!(!is_method_allowed("verifysignature", &[raw("{\"signature\":\"sig\",\"filename\":\"x\"}")]));
+}
+
+#[test]
+fn verifysignature_non_object_blocked() {
+    assert!(!is_method_allowed("verifysignature", &[raw("\"notanobj\"")]));
+}
+
+#[test]
+fn verifysignature_zero_params_allowed() {
+    assert!(!is_method_allowed("verifysignature", &[]));
+}
+
+#[test]
+fn verifysignature_two_params_blocked() {
+    assert!(!is_method_allowed("verifysignature", &[raw("{}"), raw("{}")]));
+}
