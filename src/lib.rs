@@ -1,14 +1,16 @@
 use hyper::{Body, Request, Response};
-use serde_json::{Value, json};
-use jsonrpc::{Client, error::RpcError};
 use jsonrpc::simple_http::{self, SimpleHttpTransport};
+use jsonrpc::{error::RpcError, Client};
 use serde_json::value::RawValue;
+use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use tokio::time::{timeout, Duration};
 
 pub mod allowlist;
 pub mod auth;
+pub mod usage_log;
 use auth::AuthState;
+use usage_log::ApiUsageLog;
 
 const READ_TIMEOUT_SECS: Duration = Duration::from_secs(5);
 // 1 MiB — sufficient for any JSON-RPC payload on this API surface.
@@ -25,37 +27,59 @@ impl VerusRPC {
             .url(url)?
             .auth(user, Some(pass))
             .build();
-        Ok(VerusRPC { client: Arc::new(Mutex::new(Client::with_transport(transport))) })
+        Ok(VerusRPC {
+            client: Arc::new(Mutex::new(Client::with_transport(transport))),
+        })
     }
 
     fn handle(&self, req_body: Value) -> Result<Value, RpcError> {
         let method = match req_body["method"].as_str() {
             Some(method) => method,
-            None => return Err(RpcError { code: -32602, message: "Invalid method parameter".into(), data: None }),
+            None => {
+                return Err(RpcError {
+                    code: -32602,
+                    message: "Invalid method parameter".into(),
+                    data: None,
+                })
+            }
         };
         let params: Vec<Box<RawValue>> = match req_body["params"].as_array() {
             Some(params) => {
-                params.iter().enumerate().map(|(i, v)| {
-                    if method == "getblock" && i == 0 {
-                        if let Ok(num) = v.to_string().parse::<i64>() {
-                            // Legacy hack because getblock in JS used to allow
-                            // strings to be passed in clientside and the former JS rpc server
-                            // wouldn't care. This will be deprecated in the future and shouldn't
-                            // be relied upon.
-                            RawValue::from_string(format!("\"{}\"", num)).unwrap()
+                params
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        if method == "getblock" && i == 0 {
+                            if let Ok(num) = v.to_string().parse::<i64>() {
+                                // Legacy hack because getblock in JS used to allow
+                                // strings to be passed in clientside and the former JS rpc server
+                                // wouldn't care. This will be deprecated in the future and shouldn't
+                                // be relied upon.
+                                RawValue::from_string(format!("\"{}\"", num)).unwrap()
+                            } else {
+                                RawValue::from_string(v.to_string()).unwrap()
+                            }
                         } else {
                             RawValue::from_string(v.to_string()).unwrap()
                         }
-                    } else {
-                        RawValue::from_string(v.to_string()).unwrap()
-                    }
-                }).collect()
-            },
-            None => return Err(RpcError { code: -32602, message: "Invalid params parameter".into(), data: None }),
+                    })
+                    .collect()
+            }
+            None => {
+                return Err(RpcError {
+                    code: -32602,
+                    message: "Invalid params parameter".into(),
+                    data: None,
+                })
+            }
         };
 
         if !allowlist::is_method_allowed(method, &params) {
-            return Err(RpcError { code: -32601, message: "Method not found".into(), data: None });
+            return Err(RpcError {
+                code: -32601,
+                message: "Method not found".into(),
+                data: None,
+            });
         }
 
         let client = self.client.lock().unwrap_or_else(|e| e.into_inner());
@@ -63,12 +87,20 @@ impl VerusRPC {
 
         let response = client.send_request(request).map_err(|e| match e {
             jsonrpc::Error::Rpc(rpc_error) => rpc_error,
-            _ => RpcError { code: -32603, message: "Internal error".into(), data: None },
+            _ => RpcError {
+                code: -32603,
+                message: "Internal error".into(),
+                data: None,
+            },
         })?;
 
         let result: Value = response.result().map_err(|e| match e {
             jsonrpc::Error::Rpc(rpc_error) => rpc_error,
-            _ => RpcError { code: -32603, message: "Internal error".into(), data: None },
+            _ => RpcError {
+                code: -32603,
+                message: "Internal error".into(),
+                data: None,
+            },
         })?;
         Ok(result)
     }
@@ -93,23 +125,38 @@ pub async fn read_body_limited(mut body: Body, limit: usize) -> Result<Vec<u8>, 
     Ok(buf)
 }
 
-pub async fn handle_req(req: Request<Body>, rpc: Arc<VerusRPC>, auth: Option<Arc<AuthState>>) -> Result<Response<Body>, hyper::Error> {
+pub async fn handle_req(
+    req: Request<Body>,
+    rpc: Arc<VerusRPC>,
+    auth: Option<Arc<AuthState>>,
+    usage_log: Option<Arc<ApiUsageLog>>,
+) -> Result<Response<Body>, hyper::Error> {
     // Split early so headers remain accessible after the body is consumed.
     let (parts, body) = req.into_parts();
 
     // Handle CORS preflight (OPTIONS) request
     if parts.method == hyper::Method::OPTIONS {
         let mut response = Response::new(Body::empty());
-        response.headers_mut().insert(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
-        response.headers_mut().insert(hyper::header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST".parse().unwrap());
+        response.headers_mut().insert(
+            hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            "*".parse().unwrap(),
+        );
+        response.headers_mut().insert(
+            hyper::header::ACCESS_CONTROL_ALLOW_METHODS,
+            "GET, POST".parse().unwrap(),
+        );
         response.headers_mut().insert(hyper::header::ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type, Authorization, Accept, X-App-ID, X-Timestamp, X-Auth-Token, X-VRPC-API-Version, X-Salt".parse().unwrap());
-        response.headers_mut().insert(hyper::header::ACCESS_CONTROL_MAX_AGE, "3600".parse().unwrap());
+        response.headers_mut().insert(
+            hyper::header::ACCESS_CONTROL_MAX_AGE,
+            "3600".parse().unwrap(),
+        );
         return Ok(response);
     }
 
     // CRIT-1 fix: size is enforced during accumulation inside read_body_limited,
     // so a missing or lying Content-Length header cannot bypass the limit.
-    let whole_body = match timeout(READ_TIMEOUT_SECS, read_body_limited(body, MAX_BODY_BYTES)).await {
+    let whole_body = match timeout(READ_TIMEOUT_SECS, read_body_limited(body, MAX_BODY_BYTES)).await
+    {
         Ok(Ok(b)) => b,
         Ok(Err(ReadBodyError::TooLarge)) => {
             return Ok(Response::builder()
@@ -144,18 +191,28 @@ pub async fn handle_req(req: Request<Body>, rpc: Arc<VerusRPC>, auth: Option<Arc
     // Auth gate: version check then token check, both before JSON parsing.
     // The full raw body is hashed so any parameter tampering invalidates the token.
     if let Some(auth_state) = &auth {
-        let version = parts.headers.get("x-vrpc-api-version")
+        let version = parts
+            .headers
+            .get("x-vrpc-api-version")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         if version != "2" {
             let mut response = Response::builder()
                 .status(hyper::StatusCode::BAD_REQUEST)
-                .body(Body::from(json!({"error": {"code": -32600, "message": "X-VRPC-API-Version: 2 required"}}).to_string()))
+                .body(Body::from(
+                    json!({"error": {"code": -32600, "message": "X-VRPC-API-Version: 2 required"}})
+                        .to_string(),
+                ))
                 .unwrap();
-            response.headers_mut().insert(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
+            response.headers_mut().insert(
+                hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                "*".parse().unwrap(),
+            );
             return Ok(response);
         }
-        let salt = parts.headers.get("x-salt")
+        let salt = parts
+            .headers
+            .get("x-salt")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         if salt.len() != 64 || !salt.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
@@ -163,57 +220,98 @@ pub async fn handle_req(req: Request<Body>, rpc: Arc<VerusRPC>, auth: Option<Arc
                 .status(hyper::StatusCode::BAD_REQUEST)
                 .body(Body::from(json!({"error": {"code": -32600, "message": "X-Salt must be exactly 64 lowercase hex characters (32 bytes)"}}).to_string()))
                 .unwrap();
-            response.headers_mut().insert(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
+            response.headers_mut().insert(
+                hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                "*".parse().unwrap(),
+            );
             return Ok(response);
         }
-        let app_id = parts.headers.get("x-app-id")
+        let app_id = parts
+            .headers
+            .get("x-app-id")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        let timestamp: i64 = parts.headers.get("x-timestamp")
+        let timestamp: i64 = parts
+            .headers
+            .get("x-timestamp")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        let token = parts.headers.get("x-auth-token")
+        let token = parts
+            .headers
+            .get("x-auth-token")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
 
         if !auth_state.check_token(token, &str_body, timestamp, app_id, version, salt) {
             let mut response = Response::builder()
                 .status(hyper::StatusCode::UNAUTHORIZED)
-                .body(Body::from(json!({"error": {"code": -32600, "message": "Unauthorized"}}).to_string()))
+                .body(Body::from(
+                    json!({"error": {"code": -32600, "message": "Unauthorized"}}).to_string(),
+                ))
                 .unwrap();
-            response.headers_mut().insert(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
+            response.headers_mut().insert(
+                hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                "*".parse().unwrap(),
+            );
             return Ok(response);
+        }
+
+        if let Some(usage_log) = &usage_log {
+            if let Err(err) = usage_log.record_call(app_id) {
+                eprintln!("Failed to record API usage for {app_id}: {err}");
+            }
         }
     }
 
     let json_body: Result<Value, _> = serde_json::from_str(&str_body);
     let result = match json_body {
         Ok(req_body) => rpc.handle(req_body),
-        Err(_) => Err(RpcError { code: -32700, message: "Parse error".into(), data: None }),
+        Err(_) => Err(RpcError {
+            code: -32700,
+            message: "Parse error".into(),
+            data: None,
+        }),
     };
 
     let mut response = match result {
         Ok(res) => Response::new(Body::from(json!({"result": res}).to_string())),
-        Err(err) => Response::new(Body::from(json!({"error": { "code": err.code, "message": err.message }}).to_string())),
+        Err(err) => Response::new(Body::from(
+            json!({"error": { "code": err.code, "message": err.message }}).to_string(),
+        )),
     };
 
     // Add CORS headers
-    response.headers_mut().insert(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
-    response.headers_mut().insert(hyper::header::ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, PUT, OPTIONS, POST".parse().unwrap());
+    response.headers_mut().insert(
+        hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        "*".parse().unwrap(),
+    );
+    response.headers_mut().insert(
+        hyper::header::ACCESS_CONTROL_ALLOW_METHODS,
+        "GET, HEAD, PUT, OPTIONS, POST".parse().unwrap(),
+    );
     response.headers_mut().insert(hyper::header::ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type, Authorization, Accept, X-App-ID, X-Timestamp, X-Auth-Token, X-VRPC-API-Version, X-Salt".parse().unwrap());
-    response.headers_mut().insert(hyper::header::ACCESS_CONTROL_MAX_AGE, "3600".parse().unwrap());
+    response.headers_mut().insert(
+        hyper::header::ACCESS_CONTROL_MAX_AGE,
+        "3600".parse().unwrap(),
+    );
 
     // Set the Referrer Policy header
-    response.headers_mut().insert(hyper::header::REFERRER_POLICY, "origin-when-cross-origin".parse().unwrap());
+    response.headers_mut().insert(
+        hyper::header::REFERRER_POLICY,
+        "origin-when-cross-origin".parse().unwrap(),
+    );
 
     Ok(response)
 }
 
 // Load TLS certificate chain and private key from PEM files.
-pub fn load_tls_config(cert_path: &str, key_path: &str) -> Result<rustls::ServerConfig, Box<dyn std::error::Error>> {
-    use std::io::BufReader;
+pub fn load_tls_config(
+    cert_path: &str,
+    key_path: &str,
+) -> Result<rustls::ServerConfig, Box<dyn std::error::Error>> {
     use std::fs::File;
+    use std::io::BufReader;
 
     let certs: Vec<rustls::Certificate> = {
         let mut reader = BufReader::new(File::open(cert_path)?);

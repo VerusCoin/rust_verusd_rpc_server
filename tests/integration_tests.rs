@@ -1,7 +1,14 @@
-use rust_verusd_rpc_server::{VerusRPC, handle_req, read_body_limited, ReadBodyError, load_tls_config, MAX_BODY_BYTES};
-use rust_verusd_rpc_server::auth::{AuthState, compute_token};
-use hyper::{Body, Request, StatusCode, server::conn::Http, service::service_fn};
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
+use hyper::{server::conn::Http, service::service_fn, Body, Request, StatusCode};
+use rust_verusd_rpc_server::auth::{compute_token, AuthState};
+use rust_verusd_rpc_server::{
+    handle_req, load_tls_config, read_body_limited, ReadBodyError, VerusRPC, MAX_BODY_BYTES,
+};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tokio::net::TcpListener;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -31,7 +38,12 @@ async fn spawn_plain_server(rpc: Arc<VerusRPC>, auth: Option<Arc<AuthState>>) ->
                     let auth = auth.clone();
                     tokio::spawn(async move {
                         let _ = Http::new()
-                            .serve_connection(tcp, service_fn(move |req| handle_req(req, rpc.clone(), auth.clone())))
+                            .serve_connection(
+                                tcp,
+                                service_fn(move |req| {
+                                    handle_req(req, rpc.clone(), auth.clone(), None)
+                                }),
+                            )
                             .await;
                     });
                 }
@@ -43,7 +55,10 @@ async fn spawn_plain_server(rpc: Arc<VerusRPC>, auth: Option<Arc<AuthState>>) ->
 }
 
 fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
 }
 
 fn make_auth(app_id: &str, api_key: &str) -> Arc<AuthState> {
@@ -56,18 +71,32 @@ fn make_auth(app_id: &str, api_key: &str) -> Arc<AuthState> {
 fn random_salt() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static CTR: AtomicU64 = AtomicU64::new(0);
-    let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
     let c = CTR.fetch_add(1, Ordering::Relaxed);
-    let mut s = t.wrapping_mul(6364136223846793005).wrapping_add(c.wrapping_mul(1442695040888963407));
+    let mut s = t
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(c.wrapping_mul(1442695040888963407));
     let mut out = String::with_capacity(64);
     for _ in 0..4 {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         out.push_str(&format!("{:016x}", s));
     }
     out
 }
 
-async fn post_with_auth_salted(addr: SocketAddr, json: &str, app_id: &str, api_key: &str, time: i64, salt: &str) -> hyper::Response<Body> {
+async fn post_with_auth_salted(
+    addr: SocketAddr,
+    json: &str,
+    app_id: &str,
+    api_key: &str,
+    time: i64,
+    salt: &str,
+) -> hyper::Response<Body> {
     let token = compute_token(api_key, json, time, app_id, "2", salt);
     hyper::Client::new()
         .request(
@@ -78,19 +107,29 @@ async fn post_with_auth_salted(addr: SocketAddr, json: &str, app_id: &str, api_k
                 .header("x-vrpc-api-version", "2")
                 .header("x-salt", salt)
                 .body(Body::from(json.to_string()))
-                .unwrap()
+                .unwrap(),
         )
         .await
         .unwrap()
 }
 
-async fn post_with_auth(addr: SocketAddr, json: &str, app_id: &str, api_key: &str, time: i64) -> hyper::Response<Body> {
+async fn post_with_auth(
+    addr: SocketAddr,
+    json: &str,
+    app_id: &str,
+    api_key: &str,
+    time: i64,
+) -> hyper::Response<Body> {
     post_with_auth_salted(addr, json, app_id, api_key, time, &random_salt()).await
 }
 
 async fn post(addr: SocketAddr, body: Body) -> hyper::Response<Body> {
     hyper::Client::new()
-        .request(Request::post(format!("http://{}", addr)).body(body).unwrap())
+        .request(
+            Request::post(format!("http://{}", addr))
+                .body(body)
+                .unwrap(),
+        )
         .await
         .unwrap()
 }
@@ -143,7 +182,10 @@ async fn body_limit_multi_chunk_accumulation_rejected() {
             }
         }
     });
-    assert!(matches!(read_body_limited(body, 1024).await, Err(ReadBodyError::TooLarge)));
+    assert!(matches!(
+        read_body_limited(body, 1024).await,
+        Err(ReadBodyError::TooLarge)
+    ));
 }
 
 #[tokio::test]
@@ -155,7 +197,11 @@ async fn http_oversized_body_no_content_length_returns_413() {
     let chunk = vec![b'x'; 1024];
     tokio::spawn(async move {
         for _ in 0..=(MAX_BODY_BYTES / 1024) + 2 {
-            if sender.send_data(hyper::body::Bytes::from(chunk.clone())).await.is_err() {
+            if sender
+                .send_data(hyper::body::Bytes::from(chunk.clone()))
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -193,9 +239,15 @@ async fn http_lying_content_length_oversized_body_rejected() {
     let chunk = vec![b'x'; 1024];
     for _ in 0..=(MAX_BODY_BYTES / 1024) + 2 {
         let line = format!("{:x}\r\n", chunk.len());
-        if stream.write_all(line.as_bytes()).await.is_err() { break; }
-        if stream.write_all(&chunk).await.is_err() { break; }
-        if stream.write_all(b"\r\n").await.is_err() { break; }
+        if stream.write_all(line.as_bytes()).await.is_err() {
+            break;
+        }
+        if stream.write_all(&chunk).await.is_err() {
+            break;
+        }
+        if stream.write_all(b"\r\n").await.is_err() {
+            break;
+        }
     }
     let _ = stream.write_all(b"0\r\n\r\n").await;
 
@@ -216,7 +268,9 @@ async fn http_body_under_limit_no_content_length_accepted() {
     let addr = spawn_plain_server(dummy_rpc(), None).await;
     let (mut sender, body) = Body::channel();
     tokio::spawn(async move {
-        let _ = sender.send_data(b"{\"method\":\"getinfo\",\"params\":[]}".to_vec().into()).await;
+        let _ = sender
+            .send_data(b"{\"method\":\"getinfo\",\"params\":[]}".to_vec().into())
+            .await;
     });
     let resp = post(addr, body).await;
     // Reaches the RPC backend (fails — no server), but must NOT be 413 or 400
@@ -230,7 +284,11 @@ async fn http_body_under_limit_no_content_length_accepted() {
 async fn options_returns_200_with_cors_headers() {
     let addr = spawn_plain_server(dummy_rpc(), None).await;
     let resp = hyper::Client::new()
-        .request(Request::options(format!("http://{}", addr)).body(Body::empty()).unwrap())
+        .request(
+            Request::options(format!("http://{}", addr))
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -286,11 +344,21 @@ async fn missing_params_field_returns_invalid_params() {
 #[tokio::test]
 async fn unlisted_method_returns_method_not_found() {
     let addr = spawn_plain_server(dummy_rpc(), None).await;
-    for method in &["getbalance", "listaccounts", "dumpprivkey", "importprivkey", "stop"] {
+    for method in &[
+        "getbalance",
+        "listaccounts",
+        "dumpprivkey",
+        "importprivkey",
+        "stop",
+    ] {
         let payload = format!("{{\"method\":\"{}\",\"params\":[]}}", method);
         let resp = post_json(addr, &payload).await;
         let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
-        assert_eq!(v["error"]["code"], -32601, "method {} should be blocked", method);
+        assert_eq!(
+            v["error"]["code"], -32601,
+            "method {} should be blocked",
+            method
+        );
     }
 }
 
@@ -311,13 +379,20 @@ async fn allowed_method_correct_params_reaches_rpc_backend() {
     let resp = post_json(addr, "{\"method\":\"getinfo\",\"params\":[]}").await;
     assert_eq!(resp.status(), StatusCode::OK);
     let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    assert_ne!(v["error"]["code"], -32601, "getinfo should pass the allowlist");
+    assert_ne!(
+        v["error"]["code"], -32601,
+        "getinfo should pass the allowlist"
+    );
 }
 
 #[tokio::test]
 async fn sendcurrency_without_simulation_flag_blocked() {
     let addr = spawn_plain_server(dummy_rpc(), None).await;
-    let resp = post_json(addr, r#"{"method":"sendcurrency","params":["*",[],0,0.001,false]}"#).await;
+    let resp = post_json(
+        addr,
+        r#"{"method":"sendcurrency","params":["*",[],0,0.001,false]}"#,
+    )
+    .await;
     let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(v["error"]["code"], -32601);
 }
@@ -325,7 +400,11 @@ async fn sendcurrency_without_simulation_flag_blocked() {
 #[tokio::test]
 async fn sendcurrency_with_simulation_flag_passes_allowlist() {
     let addr = spawn_plain_server(dummy_rpc(), None).await;
-    let resp = post_json(addr, r#"{"method":"sendcurrency","params":["*",[],0,0.001,true]}"#).await;
+    let resp = post_json(
+        addr,
+        r#"{"method":"sendcurrency","params":["*",[],0,0.001,true]}"#,
+    )
+    .await;
     let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_ne!(v["error"]["code"], -32601);
 }
@@ -333,7 +412,11 @@ async fn sendcurrency_with_simulation_flag_passes_allowlist() {
 #[tokio::test]
 async fn signdata_with_address_field_blocked() {
     let addr = spawn_plain_server(dummy_rpc(), None).await;
-    let resp = post_json(addr, r#"{"method":"signdata","params":[{"address":"R1","data":"aa"}]}"#).await;
+    let resp = post_json(
+        addr,
+        r#"{"method":"signdata","params":[{"address":"R1","data":"aa"}]}"#,
+    )
+    .await;
     let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(v["error"]["code"], -32601);
 }
@@ -341,7 +424,11 @@ async fn signdata_with_address_field_blocked() {
 #[tokio::test]
 async fn signdata_without_address_passes_allowlist() {
     let addr = spawn_plain_server(dummy_rpc(), None).await;
-    let resp = post_json(addr, r#"{"method":"signdata","params":[{"data":"aabbcc"}]}"#).await;
+    let resp = post_json(
+        addr,
+        r#"{"method":"signdata","params":[{"data":"aabbcc"}]}"#,
+    )
+    .await;
     let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_ne!(v["error"]["code"], -32601);
 }
@@ -354,9 +441,11 @@ async fn signdata_without_address_passes_allowlist() {
 async fn concurrent_requests_all_complete_successfully() {
     let addr = spawn_plain_server(dummy_rpc(), None).await;
     let handles: Vec<_> = (0..20)
-        .map(|_| tokio::spawn(async move {
-            post_json(addr, "{\"method\":\"getinfo\",\"params\":[]}").await
-        }))
+        .map(|_| {
+            tokio::spawn(
+                async move { post_json(addr, "{\"method\":\"getinfo\",\"params\":[]}").await },
+            )
+        })
         .collect();
 
     for h in handles {
@@ -376,9 +465,9 @@ fn tls_config_nonexistent_paths_fail() {
 fn tls_config_empty_files_fail() {
     let dir = tempfile::tempdir().unwrap();
     let cert = dir.path().join("cert.pem");
-    let key  = dir.path().join("key.pem");
+    let key = dir.path().join("key.pem");
     std::fs::write(&cert, "").unwrap();
-    std::fs::write(&key,  "").unwrap();
+    std::fs::write(&key, "").unwrap();
     assert!(load_tls_config(cert.to_str().unwrap(), key.to_str().unwrap()).is_err());
 }
 
@@ -387,9 +476,9 @@ fn tls_config_valid_self_signed_succeeds() {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let cert_path = dir.path().join("cert.pem");
-    let key_path  = dir.path().join("key.pem");
+    let key_path = dir.path().join("key.pem");
     std::fs::write(&cert_path, cert.serialize_pem().unwrap()).unwrap();
-    std::fs::write(&key_path,  cert.serialize_private_key_pem()).unwrap();
+    std::fs::write(&key_path, cert.serialize_private_key_pem()).unwrap();
 
     let result = load_tls_config(cert_path.to_str().unwrap(), key_path.to_str().unwrap());
     assert!(result.is_ok(), "load_tls_config failed: {:?}", result.err());
@@ -400,9 +489,9 @@ fn tls_config_swapped_cert_and_key_fails() {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let cert_path = dir.path().join("cert.pem");
-    let key_path  = dir.path().join("key.pem");
+    let key_path = dir.path().join("key.pem");
     std::fs::write(&cert_path, cert.serialize_pem().unwrap()).unwrap();
-    std::fs::write(&key_path,  cert.serialize_private_key_pem()).unwrap();
+    std::fs::write(&key_path, cert.serialize_private_key_pem()).unwrap();
 
     // cert where key expected and vice versa → must fail
     assert!(load_tls_config(key_path.to_str().unwrap(), cert_path.to_str().unwrap()).is_err());
@@ -413,15 +502,14 @@ fn tls_config_swapped_cert_and_key_fails() {
 #[tokio::test]
 async fn tls_server_accepts_https_connection_and_returns_rpc_response() {
     // 1. Generate self-signed certificate
-    let rcgen_cert =
-        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let rcgen_cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let cert_der = rcgen_cert.serialize_der().unwrap();
 
     let dir = tempfile::tempdir().unwrap();
     let cert_path = dir.path().join("cert.pem");
-    let key_path  = dir.path().join("key.pem");
+    let key_path = dir.path().join("key.pem");
     std::fs::write(&cert_path, rcgen_cert.serialize_pem().unwrap()).unwrap();
-    std::fs::write(&key_path,  rcgen_cert.serialize_private_key_pem()).unwrap();
+    std::fs::write(&key_path, rcgen_cert.serialize_private_key_pem()).unwrap();
 
     // 2. Start TLS server
     let tls_config =
@@ -435,7 +523,10 @@ async fn tls_server_accepts_https_connection_and_returns_rpc_response() {
         if let Ok((tcp, _)) = listener.accept().await {
             if let Ok(tls) = acceptor.accept(tcp).await {
                 let _ = Http::new()
-                    .serve_connection(tls, service_fn(move |req| handle_req(req, rpc.clone(), None)))
+                    .serve_connection(
+                        tls,
+                        service_fn(move |req| handle_req(req, rpc.clone(), None, None)),
+                    )
                     .await;
             }
         }
@@ -512,7 +603,7 @@ async fn auth_wrong_version_returns_400() {
                 .header("x-vrpc-api-version", "1") // wrong version
                 .header("x-salt", &salt)
                 .body(Body::from(BODY))
-                .unwrap()
+                .unwrap(),
         )
         .await
         .map(|r| assert_eq!(r.status(), StatusCode::BAD_REQUEST))
@@ -523,7 +614,8 @@ async fn auth_wrong_version_returns_400() {
 #[tokio::test]
 async fn auth_invalid_salt_returns_400() {
     let addr = spawn_plain_server(dummy_rpc(), Some(make_auth("app1", "secret"))).await;
-    for bad_salt in &["", "tooshort", &"g".repeat(64), &"A".repeat(64)] { // not hex / wrong length / uppercase hex
+    for bad_salt in &["", "tooshort", &"g".repeat(64), &"A".repeat(64)] {
+        // not hex / wrong length / uppercase hex
         hyper::Client::new()
             .request(
                 Request::post(format!("http://{}", addr))
@@ -533,10 +625,17 @@ async fn auth_invalid_salt_returns_400() {
                     .header("x-timestamp", now_ms().to_string())
                     .header("x-auth-token", "anytoken")
                     .body(Body::from(BODY))
-                    .unwrap()
+                    .unwrap(),
             )
             .await
-            .map(|r| assert_eq!(r.status(), StatusCode::BAD_REQUEST, "salt {:?} should be rejected", bad_salt))
+            .map(|r| {
+                assert_eq!(
+                    r.status(),
+                    StatusCode::BAD_REQUEST,
+                    "salt {:?} should be rejected",
+                    bad_salt
+                )
+            })
             .unwrap();
     }
 }
@@ -551,7 +650,7 @@ async fn auth_missing_token_headers_returns_401() {
                 .header("x-vrpc-api-version", "2")
                 .header("x-salt", &random_salt())
                 .body(Body::from(BODY))
-                .unwrap()
+                .unwrap(),
         )
         .await
         .map(|r| assert_eq!(r.status(), StatusCode::UNAUTHORIZED))
@@ -579,7 +678,7 @@ async fn auth_wrong_token_returns_401() {
                 .header("x-vrpc-api-version", "2")
                 .header("x-salt", &random_salt())
                 .body(Body::from(BODY))
-                .unwrap()
+                .unwrap(),
         )
         .await
         .map(|r| assert_eq!(r.status(), StatusCode::UNAUTHORIZED))
@@ -605,7 +704,7 @@ async fn auth_body_tampered_returns_401() {
                 .header("x-vrpc-api-version", "2")
                 .header("x-salt", &salt)
                 .body(Body::from(tampered_body))
-                .unwrap()
+                .unwrap(),
         )
         .await
         .map(|r| assert_eq!(r.status(), StatusCode::UNAUTHORIZED))
@@ -637,10 +736,18 @@ async fn auth_replay_same_time_and_salt_rejected() {
     let salt = random_salt(); // same salt for both requests
 
     let r1 = post_with_auth_salted(addr, BODY, "app1", "secret", time, &salt).await;
-    assert_ne!(r1.status(), StatusCode::UNAUTHORIZED, "first request should pass");
+    assert_ne!(
+        r1.status(),
+        StatusCode::UNAUTHORIZED,
+        "first request should pass"
+    );
 
     let r2 = post_with_auth_salted(addr, BODY, "app1", "secret", time, &salt).await;
-    assert_eq!(r2.status(), StatusCode::UNAUTHORIZED, "replayed (time, salt) should be rejected");
+    assert_eq!(
+        r2.status(),
+        StatusCode::UNAUTHORIZED,
+        "replayed (time, salt) should be rejected"
+    );
 }
 
 /// Same timestamp with different salts → both requests pass (solves multi-client collision).
@@ -651,10 +758,18 @@ async fn auth_same_time_different_salt_both_pass() {
     let time = now_ms();
 
     let r1 = post_with_auth_salted(addr, BODY, "app1", "secret", time, &"a".repeat(64)).await;
-    assert_ne!(r1.status(), StatusCode::UNAUTHORIZED, "first client should pass");
+    assert_ne!(
+        r1.status(),
+        StatusCode::UNAUTHORIZED,
+        "first client should pass"
+    );
 
     let r2 = post_with_auth_salted(addr, BODY, "app1", "secret", time, &"b".repeat(64)).await;
-    assert_ne!(r2.status(), StatusCode::UNAUTHORIZED, "second client with same time but different salt should also pass");
+    assert_ne!(
+        r2.status(),
+        StatusCode::UNAUTHORIZED,
+        "second client with same time but different salt should also pass"
+    );
 }
 
 /// When auth is disabled (None), requests with no auth headers pass normally.
