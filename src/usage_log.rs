@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
-use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Mutex;
@@ -31,7 +31,6 @@ pub struct ApiUsageLog {
 
 struct ApiUsageLogInner {
     configured_app_ids: Vec<String>,
-    historical_buckets_by_app: HashMap<String, BTreeMap<i64, u64>>,
     current_run_buckets_by_app: HashMap<String, BTreeMap<i64, u64>>,
     run_started_at_ms: i64,
 }
@@ -50,7 +49,6 @@ impl ApiUsageLog {
         configured_app_ids.sort();
         configured_app_ids.dedup();
 
-        let historical_buckets_by_app = load_historical_buckets(&log_dir, run_started_at_ms)?;
         let mut current_run_buckets_by_app = HashMap::new();
         for app_id in &configured_app_ids {
             current_run_buckets_by_app.insert(app_id.clone(), BTreeMap::new());
@@ -60,7 +58,6 @@ impl ApiUsageLog {
             path: log_dir.join(unique_log_filename()),
             inner: Mutex::new(ApiUsageLogInner {
                 configured_app_ids,
-                historical_buckets_by_app,
                 current_run_buckets_by_app,
                 run_started_at_ms,
             }),
@@ -105,18 +102,16 @@ impl ApiUsageLog {
 
 impl ApiUsageLogInner {
     fn prune_old(&mut self, now_ms: i64) {
-        prune_bucket_sets(&mut self.historical_buckets_by_app, now_ms);
         prune_bucket_sets(&mut self.current_run_buckets_by_app, now_ms);
     }
 
     fn snapshot_for(&self, app_id: &str, now_ms: i64) -> WindowCounts {
-        let historical = self.historical_buckets_by_app.get(app_id);
         let current_run = self.current_run_buckets_by_app.get(app_id);
         WindowCounts {
-            last_hour: count_since(historical, current_run, now_ms - LAST_HOUR_MS),
-            last_24_hours: count_since(historical, current_run, now_ms - LAST_24_HOURS_MS),
-            last_7_days: count_since(historical, current_run, now_ms - LAST_7_DAYS_MS),
-            last_30_days: count_since(historical, current_run, now_ms - LAST_30_DAYS_MS),
+            last_hour: count_since(current_run, now_ms - LAST_HOUR_MS),
+            last_24_hours: count_since(current_run, now_ms - LAST_24_HOURS_MS),
+            last_7_days: count_since(current_run, now_ms - LAST_7_DAYS_MS),
+            last_30_days: count_since(current_run, now_ms - LAST_30_DAYS_MS),
         }
     }
 
@@ -124,11 +119,6 @@ impl ApiUsageLogInner {
         let mut apps = serde_json::Map::new();
         for app_id in &self.configured_app_ids {
             let counts = self.snapshot_for(app_id, now_ms);
-            let run_buckets = self
-                .current_run_buckets_by_app
-                .get(app_id)
-                .map(serialize_bucket_counts)
-                .unwrap_or_default();
             apps.insert(
                 app_id.clone(),
                 json!({
@@ -137,8 +127,7 @@ impl ApiUsageLogInner {
                         "last_24_hours": counts.last_24_hours,
                         "last_7_days": counts.last_7_days,
                         "last_30_days": counts.last_30_days,
-                    },
-                    "run_buckets": run_buckets,
+                    }
                 }),
             );
         }
@@ -153,126 +142,6 @@ impl ApiUsageLogInner {
             "apps": apps,
         })
     }
-}
-
-fn load_historical_buckets(
-    log_dir: &Path,
-    now_ms: i64,
-) -> io::Result<HashMap<String, BTreeMap<i64, u64>>> {
-    let mut files = Vec::new();
-    for entry in fs::read_dir(log_dir)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !name.starts_with(FILE_PREFIX) {
-            continue;
-        }
-        if name.ends_with(SNAPSHOT_FILE_SUFFIX) {
-            files.push(entry.path());
-        }
-    }
-    files.sort();
-
-    let mut buckets_by_app = HashMap::new();
-    for path in files {
-        if path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext.eq_ignore_ascii_case("json"))
-            .unwrap_or(false)
-        {
-            merge_snapshot_buckets(&path, now_ms, &mut buckets_by_app)?;
-        } else {
-            merge_legacy_event_buckets(&path, now_ms, &mut buckets_by_app)?;
-        }
-    }
-    prune_bucket_sets(&mut buckets_by_app, now_ms);
-    Ok(buckets_by_app)
-}
-
-fn merge_snapshot_buckets(
-    path: &Path,
-    now_ms: i64,
-    buckets_by_app: &mut HashMap<String, BTreeMap<i64, u64>>,
-) -> io::Result<()> {
-    let contents = fs::read_to_string(path)?;
-    let Ok(value) = serde_json::from_str::<Value>(&contents) else {
-        return Ok(());
-    };
-    if value.get("format").and_then(Value::as_str) != Some(SNAPSHOT_FORMAT) {
-        return Ok(());
-    }
-    let Some(apps) = value.get("apps").and_then(Value::as_object) else {
-        return Ok(());
-    };
-
-    let cutoff_ms = now_ms - LAST_30_DAYS_MS;
-    for (app_id, app_value) in apps {
-        let Some(run_buckets) = app_value.get("run_buckets").and_then(Value::as_array) else {
-            continue;
-        };
-        let app_buckets = buckets_by_app.entry(app_id.clone()).or_default();
-        for bucket in run_buckets {
-            let Some(bucket) = bucket.as_array() else {
-                continue;
-            };
-            if bucket.len() != 2 {
-                continue;
-            }
-            let Some(bucket_start_ms) = bucket[0].as_i64() else {
-                continue;
-            };
-            let Some(count) = bucket[1].as_u64() else {
-                continue;
-            };
-            if bucket_start_ms >= cutoff_ms && bucket_start_ms <= now_ms {
-                *app_buckets.entry(bucket_start_ms).or_insert(0) += count;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn merge_legacy_event_buckets(
-    path: &Path,
-    now_ms: i64,
-    buckets_by_app: &mut HashMap<String, BTreeMap<i64, u64>>,
-) -> io::Result<()> {
-    let cutoff_ms = now_ms - LAST_30_DAYS_MS;
-    let reader = BufReader::new(File::open(path)?);
-    for line in reader.lines() {
-        let line = line?;
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        if value.get("type").and_then(Value::as_str) != Some("api_call") {
-            continue;
-        }
-        let Some(app_id) = value.get("app_id").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(timestamp_ms) = value.get("timestamp_ms").and_then(Value::as_i64) else {
-            continue;
-        };
-        if timestamp_ms >= cutoff_ms && timestamp_ms <= now_ms {
-            let bucket_start_ms = bucket_start_ms(timestamp_ms);
-            let app_buckets = buckets_by_app.entry(app_id.to_string()).or_default();
-            *app_buckets.entry(bucket_start_ms).or_insert(0) += 1;
-        }
-    }
-    Ok(())
-}
-
-fn serialize_bucket_counts(bucket_counts: &BTreeMap<i64, u64>) -> Value {
-    Value::Array(
-        bucket_counts
-            .iter()
-            .map(|(bucket_start_ms, count)| json!([bucket_start_ms, count]))
-            .collect(),
-    )
 }
 
 fn atomic_write_json(path: &Path, value: &Value) -> io::Result<()> {
@@ -303,17 +172,8 @@ fn prune_bucket_counts(bucket_counts: &mut BTreeMap<i64, u64>, now_ms: i64) {
     }
 }
 
-fn count_since(
-    historical: Option<&BTreeMap<i64, u64>>,
-    current_run: Option<&BTreeMap<i64, u64>>,
-    cutoff_ms: i64,
-) -> usize {
+fn count_since(bucket_counts: Option<&BTreeMap<i64, u64>>, cutoff_ms: i64) -> usize {
     let cutoff_bucket_ms = bucket_start_ms(cutoff_ms);
-    count_buckets_since(historical, cutoff_bucket_ms)
-        + count_buckets_since(current_run, cutoff_bucket_ms)
-}
-
-fn count_buckets_since(bucket_counts: Option<&BTreeMap<i64, u64>>, cutoff_bucket_ms: i64) -> usize {
     bucket_counts
         .map(|bucket_counts| {
             bucket_counts
@@ -370,7 +230,7 @@ mod tests {
         assert_eq!(snapshot["app_ids"], json!(["valu-mobile", "verus-mobile"]));
         assert_eq!(snapshot["apps"]["verus-mobile"]["counts"]["last_hour"], 0);
         assert_eq!(snapshot["apps"]["valu-mobile"]["counts"]["last_30_days"], 0);
-        assert_eq!(snapshot["apps"]["verus-mobile"]["run_buckets"], json!([]));
+        assert!(snapshot["apps"]["verus-mobile"].get("run_buckets").is_none());
     }
 
     #[test]
@@ -395,54 +255,31 @@ mod tests {
         log.flush_snapshot_at(base + 30_000).unwrap();
         let snapshot = read_json(log.log_path());
         assert_eq!(snapshot["apps"]["verus-mobile"]["counts"]["last_hour"], 1);
-        assert_eq!(
-            snapshot["apps"]["verus-mobile"]["run_buckets"],
-            json!([[bucket_start_ms(base + 5_000), 1]])
-        );
+        assert!(snapshot["apps"]["verus-mobile"].get("run_buckets").is_none());
     }
 
     #[test]
-    fn new_snapshots_only_serialize_current_run_history() {
+    fn prunes_internal_run_buckets_older_than_30_days() {
         let dir = tempfile::tempdir().unwrap();
-        let previous_snapshot_path = dir.path().join("api-call-counts-older-pid1.json");
-        let base = now_ms();
-        fs::write(
-            &previous_snapshot_path,
-            json!({
-                "format": SNAPSHOT_FORMAT,
-                "updated_at_ms": base - 30_000,
-                "run_started_at_ms": base - 60_000,
-                "pid": 1,
-                "bucket_size_seconds": 30,
-                "app_ids": ["verus-mobile"],
-                "apps": {
-                    "verus-mobile": {
-                        "counts": {
-                            "last_hour": 3,
-                            "last_24_hours": 3,
-                            "last_7_days": 3,
-                            "last_30_days": 3
-                        },
-                        "run_buckets": [[bucket_start_ms(base - 45_000), 3]]
-                    }
-                }
-            })
-            .to_string(),
-        )
-        .unwrap();
-
         let log = ApiUsageLog::new(dir.path(), vec!["verus-mobile".to_string()]).unwrap();
-        let startup = read_json(log.log_path());
-        assert_eq!(startup["apps"]["verus-mobile"]["counts"]["last_hour"], 3);
-        assert_eq!(startup["apps"]["verus-mobile"]["run_buckets"], json!([]));
+        let base = now_ms();
+        let stale_bucket_ms = base - LAST_30_DAYS_MS - BUCKET_MS;
+        let fresh_bucket_ms = base;
 
-        log.record_call_at("verus-mobile", base + 5_000).unwrap();
-        log.flush_snapshot_at(base + 30_000).unwrap();
+        log.record_call_at("verus-mobile", stale_bucket_ms).unwrap();
+        log.record_call_at("verus-mobile", fresh_bucket_ms).unwrap();
+
+        {
+            let inner = log.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let buckets = inner.current_run_buckets_by_app.get("verus-mobile").unwrap();
+            assert_eq!(buckets.len(), 1);
+            assert!(buckets.contains_key(&bucket_start_ms(fresh_bucket_ms)));
+            assert!(!buckets.contains_key(&bucket_start_ms(stale_bucket_ms)));
+        }
+
+        log.flush_snapshot_at(base).unwrap();
         let snapshot = read_json(log.log_path());
-        assert_eq!(snapshot["apps"]["verus-mobile"]["counts"]["last_hour"], 4);
-        assert_eq!(
-            snapshot["apps"]["verus-mobile"]["run_buckets"],
-            json!([[bucket_start_ms(base + 5_000), 1]])
-        );
+        assert_eq!(snapshot["apps"]["verus-mobile"]["counts"]["last_30_days"], 1);
+        assert!(snapshot["apps"]["verus-mobile"].get("run_buckets").is_none());
     }
 }
