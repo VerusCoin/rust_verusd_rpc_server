@@ -435,8 +435,8 @@ async fn signdata_without_address_passes_allowlist() {
 
 // ── HIGH-4: shared VerusRPC — concurrent-request behavioral test ──────────────
 
-/// 20 concurrent requests must all complete. This would surface mutex poisoning
-/// or connection exhaustion if the old per-connection VerusRPC bug were present.
+/// 20 concurrent requests must all complete. This surfaces connection exhaustion
+/// or accidental request serialization in the shared VerusRPC path.
 #[tokio::test]
 async fn concurrent_requests_all_complete_successfully() {
     let addr = spawn_plain_server(dummy_rpc(), None).await;

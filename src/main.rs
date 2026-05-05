@@ -127,12 +127,17 @@ async fn main() {
                                     .serve_connection(
                                         tls,
                                         service_fn(move |req| {
+                                            let log_config = if request_logging {
+                                                RequestLogConfig::enabled_for_peer(peer_addr)
+                                            } else {
+                                                RequestLogConfig::disabled()
+                                            };
                                             handle_req_with_logging(
                                                 req,
                                                 rpc.clone(),
                                                 auth.clone(),
                                                 usage_log.clone(),
-                                                RequestLogConfig::enabled_for_peer(peer_addr),
+                                                log_config,
                                             )
                                         }),
                                     )
@@ -164,12 +169,17 @@ async fn main() {
                             .serve_connection(
                                 tcp,
                                 service_fn(move |req| {
+                                    let log_config = if request_logging {
+                                        RequestLogConfig::enabled_for_peer(peer_addr)
+                                    } else {
+                                        RequestLogConfig::disabled()
+                                    };
                                     handle_req_with_logging(
                                         req,
                                         rpc.clone(),
                                         auth.clone(),
                                         usage_log.clone(),
-                                        RequestLogConfig::enabled_for_peer(peer_addr),
+                                        log_config,
                                     )
                                 }),
                             )
