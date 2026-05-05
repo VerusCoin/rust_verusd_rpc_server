@@ -3,7 +3,10 @@ use jsonrpc::simple_http::{self, SimpleHttpTransport};
 use jsonrpc::{error::RpcError, Client};
 use serde_json::value::RawValue;
 use serde_json::{json, Value};
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio::time::{timeout, Duration};
 
 pub mod allowlist;
@@ -13,9 +16,84 @@ use auth::AuthState;
 use usage_log::ApiUsageLog;
 
 const READ_TIMEOUT_SECS: Duration = Duration::from_secs(5);
+static NEXT_REQUEST_LOG_ID: AtomicU64 = AtomicU64::new(1);
 // 1 MiB — sufficient for any JSON-RPC payload on this API surface.
 // Enforced on actual accumulated bytes, not the Content-Length header.
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RequestLogConfig {
+    pub enabled: bool,
+    pub peer_addr: Option<SocketAddr>,
+}
+
+impl RequestLogConfig {
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            peer_addr: None,
+        }
+    }
+
+    pub fn enabled_for_peer(peer_addr: SocketAddr) -> Self {
+        Self {
+            enabled: true,
+            peer_addr: Some(peer_addr),
+        }
+    }
+}
+
+struct RequestTrace {
+    config: RequestLogConfig,
+    id: u64,
+    started_at: Instant,
+}
+
+impl RequestTrace {
+    fn new(config: RequestLogConfig) -> Self {
+        let id = if config.enabled {
+            NEXT_REQUEST_LOG_ID.fetch_add(1, Ordering::Relaxed)
+        } else {
+            0
+        };
+
+        Self {
+            config,
+            id,
+            started_at: Instant::now(),
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.config.enabled
+    }
+
+    fn peer_label(&self) -> String {
+        self.config
+            .peer_addr
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    fn log(&self, message: impl AsRef<str>) {
+        if self.enabled() {
+            eprintln!(
+                "[request:{} +{}ms] {}",
+                self.id,
+                self.started_at.elapsed().as_millis(),
+                message.as_ref()
+            );
+        }
+    }
+}
+
+macro_rules! request_log {
+    ($trace:expr, $($arg:tt)*) => {
+        if $trace.enabled() {
+            $trace.log(format!($($arg)*));
+        }
+    };
+}
 
 pub struct VerusRPC {
     client: Arc<Mutex<Client>>,
@@ -32,19 +110,29 @@ impl VerusRPC {
         })
     }
 
-    fn handle(&self, req_body: Value) -> Result<Value, RpcError> {
+    fn handle(&self, req_body: Value, trace: &RequestTrace) -> Result<Value, RpcError> {
         let method = match req_body["method"].as_str() {
-            Some(method) => method,
+            Some(method) => {
+                request_log!(trace, "JSON-RPC method extracted: {method}");
+                method
+            }
             None => {
+                trace.log("JSON-RPC validation failed: missing or non-string method");
                 return Err(RpcError {
                     code: -32602,
                     message: "Invalid method parameter".into(),
                     data: None,
-                })
+                });
             }
         };
         let params: Vec<Box<RawValue>> = match req_body["params"].as_array() {
             Some(params) => {
+                request_log!(
+                    trace,
+                    "JSON-RPC params accepted as array: count={}, params={}",
+                    params.len(),
+                    Value::Array(params.clone())
+                );
                 params
                     .iter()
                     .enumerate()
@@ -66,42 +154,93 @@ impl VerusRPC {
                     .collect()
             }
             None => {
+                trace.log("JSON-RPC validation failed: missing or non-array params");
                 return Err(RpcError {
                     code: -32602,
                     message: "Invalid params parameter".into(),
                     data: None,
-                })
+                });
             }
         };
 
         if !allowlist::is_method_allowed(method, &params) {
+            request_log!(
+                trace,
+                "allowlist rejected method={method}, params_count={}",
+                params.len()
+            );
             return Err(RpcError {
                 code: -32601,
                 message: "Method not found".into(),
                 data: None,
             });
         }
+        request_log!(
+            trace,
+            "allowlist accepted method={method}, params_count={}",
+            params.len()
+        );
 
+        let lock_started_at = Instant::now();
+        trace.log("waiting for shared JSON-RPC backend client lock");
         let client = self.client.lock().unwrap_or_else(|e| e.into_inner());
+        request_log!(
+            trace,
+            "acquired JSON-RPC backend client lock after {}ms",
+            lock_started_at.elapsed().as_millis()
+        );
         let request = client.build_request(method, &params);
 
-        let response = client.send_request(request).map_err(|e| match e {
-            jsonrpc::Error::Rpc(rpc_error) => rpc_error,
-            _ => RpcError {
-                code: -32603,
-                message: "Internal error".into(),
-                data: None,
-            },
+        let send_started_at = Instant::now();
+        request_log!(
+            trace,
+            "sending request to Verus RPC backend: method={method}"
+        );
+        let response = client.send_request(request).map_err(|e| {
+            request_log!(
+                trace,
+                "Verus RPC backend send_request failed after {}ms: {:?}",
+                send_started_at.elapsed().as_millis(),
+                e
+            );
+            match e {
+                jsonrpc::Error::Rpc(rpc_error) => rpc_error,
+                _ => RpcError {
+                    code: -32603,
+                    message: "Internal error".into(),
+                    data: None,
+                },
+            }
         })?;
+        request_log!(
+            trace,
+            "Verus RPC backend send_request completed after {}ms",
+            send_started_at.elapsed().as_millis()
+        );
 
-        let result: Value = response.result().map_err(|e| match e {
-            jsonrpc::Error::Rpc(rpc_error) => rpc_error,
-            _ => RpcError {
-                code: -32603,
-                message: "Internal error".into(),
-                data: None,
-            },
+        let result_started_at = Instant::now();
+        let result: Value = response.result().map_err(|e| {
+            request_log!(
+                trace,
+                "Verus RPC backend response.result failed after {}ms: {:?}",
+                result_started_at.elapsed().as_millis(),
+                e
+            );
+            match e {
+                jsonrpc::Error::Rpc(rpc_error) => rpc_error,
+                _ => RpcError {
+                    code: -32603,
+                    message: "Internal error".into(),
+                    data: None,
+                },
+            }
         })?;
+        request_log!(
+            trace,
+            "Verus RPC backend returned result after {}ms: {}",
+            result_started_at.elapsed().as_millis(),
+            result
+        );
         Ok(result)
     }
 }
@@ -131,11 +270,33 @@ pub async fn handle_req(
     auth: Option<Arc<AuthState>>,
     usage_log: Option<Arc<ApiUsageLog>>,
 ) -> Result<Response<Body>, hyper::Error> {
+    handle_req_with_logging(req, rpc, auth, usage_log, RequestLogConfig::disabled()).await
+}
+
+pub async fn handle_req_with_logging(
+    req: Request<Body>,
+    rpc: Arc<VerusRPC>,
+    auth: Option<Arc<AuthState>>,
+    usage_log: Option<Arc<ApiUsageLog>>,
+    log_config: RequestLogConfig,
+) -> Result<Response<Body>, hyper::Error> {
+    let trace = RequestTrace::new(log_config);
+
     // Split early so headers remain accessible after the body is consumed.
     let (parts, body) = req.into_parts();
+    request_log!(
+        trace,
+        "incoming request: peer={}, method={}, uri={}, version={:?}, headers={}",
+        trace.peer_label(),
+        parts.method,
+        parts.uri,
+        parts.version,
+        headers_for_log(&parts.headers)
+    );
 
     // Handle CORS preflight (OPTIONS) request
     if parts.method == hyper::Method::OPTIONS {
+        trace.log("handling CORS preflight request");
         let mut response = Response::new(Body::empty());
         response.headers_mut().insert(
             hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
@@ -150,81 +311,122 @@ pub async fn handle_req(
             hyper::header::ACCESS_CONTROL_MAX_AGE,
             "3600".parse().unwrap(),
         );
-        return Ok(response);
+        return log_and_return_response(&trace, response, "");
     }
 
     // CRIT-1 fix: size is enforced during accumulation inside read_body_limited,
     // so a missing or lying Content-Length header cannot bypass the limit.
     let whole_body = match timeout(READ_TIMEOUT_SECS, read_body_limited(body, MAX_BODY_BYTES)).await
     {
-        Ok(Ok(b)) => b,
+        Ok(Ok(b)) => {
+            request_log!(trace, "request body read completed: bytes={}", b.len());
+            b
+        }
         Ok(Err(ReadBodyError::TooLarge)) => {
-            return Ok(Response::builder()
+            request_log!(
+                trace,
+                "request body rejected: exceeded {} byte limit",
+                MAX_BODY_BYTES
+            );
+            let body_text = "Payload too large";
+            let response = Response::builder()
                 .status(hyper::StatusCode::PAYLOAD_TOO_LARGE)
-                .body(Body::from("Payload too large"))
-                .unwrap());
+                .body(Body::from(body_text))
+                .unwrap();
+            return log_and_return_response(&trace, response, body_text);
         }
         Ok(Err(ReadBodyError::ReadFailed)) => {
-            return Ok(Response::builder()
+            trace.log("request body read failed");
+            let body_text = "Failed to read request body";
+            let response = Response::builder()
                 .status(hyper::StatusCode::BAD_REQUEST)
-                .body(Body::from("Failed to read request body"))
-                .unwrap());
+                .body(Body::from(body_text))
+                .unwrap();
+            return log_and_return_response(&trace, response, body_text);
         }
         Err(_) => {
-            return Ok(Response::builder()
+            request_log!(
+                trace,
+                "request body read timed out after {}s",
+                READ_TIMEOUT_SECS.as_secs()
+            );
+            let body_text = "Failed to read request body - timeout";
+            let response = Response::builder()
                 .status(hyper::StatusCode::BAD_REQUEST)
-                .body(Body::from("Failed to read request body - timeout"))
-                .unwrap());
+                .body(Body::from(body_text))
+                .unwrap();
+            return log_and_return_response(&trace, response, body_text);
         }
     };
 
     let str_body = match String::from_utf8(whole_body) {
-        Ok(s) => s,
+        Ok(s) => {
+            request_log!(
+                trace,
+                "request body decoded as UTF-8: chars={}, body={}",
+                s.chars().count(),
+                s
+            );
+            s
+        }
         Err(_e) => {
-            return Ok(Response::builder()
+            trace.log("request body rejected: invalid UTF-8");
+            let body_text = "Invalid UTF-8 in request body";
+            let response = Response::builder()
                 .status(hyper::StatusCode::BAD_REQUEST)
-                .body(Body::from("Invalid UTF-8 in request body"))
-                .unwrap());
+                .body(Body::from(body_text))
+                .unwrap();
+            return log_and_return_response(&trace, response, body_text);
         }
     };
 
     // Auth gate: version check then token check, both before JSON parsing.
     // The full raw body is hashed so any parameter tampering invalidates the token.
     if let Some(auth_state) = &auth {
+        trace.log("API key auth enabled for request");
         let version = parts
             .headers
             .get("x-vrpc-api-version")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
+        request_log!(trace, "auth header x-vrpc-api-version={version:?}");
         if version != "2" {
+            trace.log("auth rejected: X-VRPC-API-Version must be 2");
+            let body_text =
+                json!({"error": {"code": -32600, "message": "X-VRPC-API-Version: 2 required"}})
+                    .to_string();
             let mut response = Response::builder()
                 .status(hyper::StatusCode::BAD_REQUEST)
-                .body(Body::from(
-                    json!({"error": {"code": -32600, "message": "X-VRPC-API-Version: 2 required"}})
-                        .to_string(),
-                ))
+                .body(Body::from(body_text.clone()))
                 .unwrap();
             response.headers_mut().insert(
                 hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
                 "*".parse().unwrap(),
             );
-            return Ok(response);
+            return log_and_return_response(&trace, response, &body_text);
         }
         let salt = parts
             .headers
             .get("x-salt")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
+        request_log!(
+            trace,
+            "auth header x-salt length={}, value={salt:?}",
+            salt.len()
+        );
         if salt.len() != 64 || !salt.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            trace.log("auth rejected: X-Salt malformed");
+            let body_text = json!({"error": {"code": -32600, "message": "X-Salt must be exactly 64 lowercase hex characters (32 bytes)"}}).to_string();
             let mut response = Response::builder()
                 .status(hyper::StatusCode::BAD_REQUEST)
-                .body(Body::from(json!({"error": {"code": -32600, "message": "X-Salt must be exactly 64 lowercase hex characters (32 bytes)"}}).to_string()))
+                .body(Body::from(body_text.clone()))
                 .unwrap();
             response.headers_mut().insert(
                 hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
                 "*".parse().unwrap(),
             );
-            return Ok(response);
+            return log_and_return_response(&trace, response, &body_text);
         }
         let app_id = parts
             .headers
@@ -242,44 +444,88 @@ pub async fn handle_req(
             .get("x-auth-token")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
+        request_log!(
+            trace,
+            "auth headers parsed: app_id={app_id:?}, timestamp_ms={timestamp}, token_chars={}",
+            token.len()
+        );
 
-        if !auth_state.check_token(token, &str_body, timestamp, app_id, version, salt) {
-            let mut response = Response::builder()
-                .status(hyper::StatusCode::UNAUTHORIZED)
-                .body(Body::from(
-                    json!({"error": {"code": -32600, "message": "Unauthorized"}}).to_string(),
-                ))
-                .unwrap();
-            response.headers_mut().insert(
-                hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
-                "*".parse().unwrap(),
-            );
-            return Ok(response);
+        match auth_state.check_token_detailed(token, &str_body, timestamp, app_id, version, salt) {
+            Ok(()) => trace.log("auth accepted"),
+            Err(reason) => {
+                request_log!(trace, "auth rejected: {:?}", reason);
+                let body_text =
+                    json!({"error": {"code": -32600, "message": "Unauthorized"}}).to_string();
+                let mut response = Response::builder()
+                    .status(hyper::StatusCode::UNAUTHORIZED)
+                    .body(Body::from(body_text.clone()))
+                    .unwrap();
+                response.headers_mut().insert(
+                    hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                    "*".parse().unwrap(),
+                );
+                return log_and_return_response(&trace, response, &body_text);
+            }
         }
 
         if let Some(usage_log) = &usage_log {
-            if let Err(err) = usage_log.record_call(app_id) {
-                eprintln!("Failed to record API usage for {app_id}: {err}");
+            match usage_log.record_call(app_id) {
+                Ok(counts) => request_log!(
+                    trace,
+                    "API usage recorded for app_id={app_id:?}: last_hour={}, last_24_hours={}, last_7_days={}, last_30_days={}",
+                    counts.last_hour,
+                    counts.last_24_hours,
+                    counts.last_7_days,
+                    counts.last_30_days
+                ),
+                Err(err) => {
+                    request_log!(
+                        trace,
+                        "API usage record failed for app_id={app_id:?}: {err}"
+                    );
+                    eprintln!("Failed to record API usage for {app_id}: {err}");
+                }
             }
         }
+    } else {
+        trace.log("API key auth disabled for request");
     }
 
     let json_body: Result<Value, _> = serde_json::from_str(&str_body);
     let result = match json_body {
-        Ok(req_body) => rpc.handle(req_body),
-        Err(_) => Err(RpcError {
-            code: -32700,
-            message: "Parse error".into(),
-            data: None,
-        }),
+        Ok(req_body) => {
+            request_log!(trace, "JSON parse accepted body: {}", req_body);
+            rpc.handle(req_body, &trace)
+        }
+        Err(err) => {
+            request_log!(trace, "JSON parse failed: {err}");
+            Err(RpcError {
+                code: -32700,
+                message: "Parse error".into(),
+                data: None,
+            })
+        }
     };
 
-    let mut response = match result {
-        Ok(res) => Response::new(Body::from(json!({"result": res}).to_string())),
-        Err(err) => Response::new(Body::from(
-            json!({"error": { "code": err.code, "message": err.message }}).to_string(),
-        )),
+    let response_body = match result {
+        Ok(res) => {
+            request_log!(
+                trace,
+                "request handler succeeded with JSON-RPC result: {res}"
+            );
+            json!({"result": res}).to_string()
+        }
+        Err(err) => {
+            request_log!(
+                trace,
+                "request handler returning JSON-RPC error: code={}, message={}",
+                err.code,
+                err.message
+            );
+            json!({"error": { "code": err.code, "message": err.message }}).to_string()
+        }
     };
+    let mut response = Response::new(Body::from(response_body.clone()));
 
     // Add CORS headers
     response.headers_mut().insert(
@@ -302,7 +548,61 @@ pub async fn handle_req(
         "origin-when-cross-origin".parse().unwrap(),
     );
 
+    log_and_return_response(&trace, response, &response_body)
+}
+
+fn log_and_return_response(
+    trace: &RequestTrace,
+    response: Response<Body>,
+    body: &str,
+) -> Result<Response<Body>, hyper::Error> {
+    request_log!(
+        trace,
+        "returning response: status={}, headers={}, body_bytes={}, body={}",
+        response.status(),
+        headers_for_log(response.headers()),
+        body.as_bytes().len(),
+        body
+    );
     Ok(response)
+}
+
+fn headers_for_log(headers: &hyper::HeaderMap) -> Value {
+    let mut map = serde_json::Map::new();
+    for (name, value) in headers.iter() {
+        let key = name.as_str().to_string();
+        let value = header_value_for_log(name.as_str(), value);
+        if let Some(existing) = map.get_mut(&key) {
+            match existing {
+                Value::Array(values) => values.push(value),
+                other => {
+                    let first = other.take();
+                    *other = Value::Array(vec![first, value]);
+                }
+            }
+        } else {
+            map.insert(key, value);
+        }
+    }
+    Value::Object(map)
+}
+
+fn header_value_for_log(name: &str, value: &hyper::header::HeaderValue) -> Value {
+    if is_sensitive_header(name) {
+        return Value::String(format!("<redacted bytes={}>", value.as_bytes().len()));
+    }
+
+    match value.to_str() {
+        Ok(value) => Value::String(value.to_string()),
+        Err(_) => Value::String(format!("<non-utf8 bytes={}>", value.as_bytes().len())),
+    }
+}
+
+fn is_sensitive_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization" | "proxy-authorization" | "x-auth-token" | "cookie" | "set-cookie"
+    )
 }
 
 // Load TLS certificate chain and private key from PEM files.

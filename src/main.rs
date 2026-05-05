@@ -1,7 +1,9 @@
 use hyper::{server::conn::Http, service::service_fn};
 use rust_verusd_rpc_server::auth::AuthState;
 use rust_verusd_rpc_server::usage_log::ApiUsageLog;
-use rust_verusd_rpc_server::{handle_req, load_tls_config, VerusRPC};
+use rust_verusd_rpc_server::{
+    handle_req_with_logging, load_tls_config, RequestLogConfig, VerusRPC,
+};
 use std::{collections::HashMap, sync::Arc};
 use tokio::net::TcpListener;
 
@@ -33,6 +35,10 @@ async fn main() {
     let server_addr = settings
         .get_string("server_addr")
         .expect("Failed to read 'server_addr' from configuration");
+    let request_logging = settings.get::<bool>("logging").unwrap_or(false);
+    if request_logging {
+        eprintln!("Verbose request logging enabled.");
+    }
 
     let rpc = Arc::new(VerusRPC::new(&url, &user, &password).unwrap());
 
@@ -103,7 +109,10 @@ async fn main() {
         eprintln!("Listening on https://{}", addr);
         loop {
             match listener.accept().await {
-                Ok((tcp, _)) => {
+                Ok((tcp, peer_addr)) => {
+                    if request_logging {
+                        eprintln!("Accepted TCP connection from {peer_addr}");
+                    }
                     let acceptor = acceptor.clone();
                     let rpc = rpc.clone();
                     let auth = auth.clone();
@@ -111,15 +120,19 @@ async fn main() {
                     tokio::spawn(async move {
                         match acceptor.accept(tcp).await {
                             Ok(tls) => {
+                                if request_logging {
+                                    eprintln!("TLS handshake completed for {peer_addr}");
+                                }
                                 if let Err(e) = Http::new()
                                     .serve_connection(
                                         tls,
                                         service_fn(move |req| {
-                                            handle_req(
+                                            handle_req_with_logging(
                                                 req,
                                                 rpc.clone(),
                                                 auth.clone(),
                                                 usage_log.clone(),
+                                                RequestLogConfig::enabled_for_peer(peer_addr),
                                             )
                                         }),
                                     )
@@ -139,7 +152,10 @@ async fn main() {
         eprintln!("Listening on http://{}", addr);
         loop {
             match listener.accept().await {
-                Ok((tcp, _)) => {
+                Ok((tcp, peer_addr)) => {
+                    if request_logging {
+                        eprintln!("Accepted TCP connection from {peer_addr}");
+                    }
                     let rpc = rpc.clone();
                     let auth = auth.clone();
                     let usage_log = usage_log.clone();
@@ -148,7 +164,13 @@ async fn main() {
                             .serve_connection(
                                 tcp,
                                 service_fn(move |req| {
-                                    handle_req(req, rpc.clone(), auth.clone(), usage_log.clone())
+                                    handle_req_with_logging(
+                                        req,
+                                        rpc.clone(),
+                                        auth.clone(),
+                                        usage_log.clone(),
+                                        RequestLogConfig::enabled_for_peer(peer_addr),
+                                    )
                                 }),
                             )
                             .await

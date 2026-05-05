@@ -33,7 +33,7 @@ cargo build
 
 ### Usage
 
-1. Configure the server by editing the Conf.toml file
+1. Configure the server by editing the Conf.toml file. Set `logging = true` to print verbose per-request diagnostics to the console while debugging.
 
 2. Run the server:
 

@@ -2,6 +2,21 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum AuthCheckFailure {
+    UnknownAppId,
+    TimestampOutOfWindow {
+        now_ms: i64,
+        request_ms: i64,
+        max_skew_ms: i64,
+    },
+    Replay {
+        timestamp_ms: i64,
+        salt: String,
+    },
+    InvalidToken,
+}
+
 pub struct AuthState {
     api_keys: HashMap<String, String>,
     // Each entry is (timestamp_ms, salt). Replay is rejected only when both match.
@@ -19,10 +34,31 @@ impl AuthState {
     /// Returns true iff `validity_key` is the correct BLAKE2b-512 token for this
     /// (app_id, body, time, version, salt) tuple, the timestamp is within 10 minutes
     /// of now, and the (time, salt) pair has not been seen before (replay guard).
-    pub fn check_token(&self, validity_key: &str, body: &str, time: i64, app_id: &str, version: &str, salt: &str) -> bool {
+    pub fn check_token(
+        &self,
+        validity_key: &str,
+        body: &str,
+        time: i64,
+        app_id: &str,
+        version: &str,
+        salt: &str,
+    ) -> bool {
+        self.check_token_detailed(validity_key, body, time, app_id, version, salt)
+            .is_ok()
+    }
+
+    pub fn check_token_detailed(
+        &self,
+        validity_key: &str,
+        body: &str,
+        time: i64,
+        app_id: &str,
+        version: &str,
+        salt: &str,
+    ) -> Result<(), AuthCheckFailure> {
         let api_key = match self.api_keys.get(app_id) {
             Some(k) => k,
-            None => return false,
+            None => return Err(AuthCheckFailure::UnknownAppId),
         };
 
         let now_ms = SystemTime::now()
@@ -31,20 +67,31 @@ impl AuthState {
             .as_millis() as i64;
 
         if (now_ms - time).abs() > 600_000 {
-            return false;
+            return Err(AuthCheckFailure::TimestampOutOfWindow {
+                now_ms,
+                request_ms: time,
+                max_skew_ms: 600_000,
+            });
         }
 
         {
             let mut seen = self.seen_times.lock().unwrap_or_else(|e| e.into_inner());
             if seen.iter().any(|(t, s)| *t == time && s == salt) {
-                return false;
+                return Err(AuthCheckFailure::Replay {
+                    timestamp_ms: time,
+                    salt: salt.to_string(),
+                });
             }
             seen.push((time, salt.to_string()));
             // Prune by time only — salt is not relevant to the expiry window.
             seen.retain(|(t, _)| (now_ms - t).abs() < 600_000);
         }
 
-        compute_token(api_key, body, time, app_id, version, salt) == validity_key
+        if compute_token(api_key, body, time, app_id, version, salt) == validity_key {
+            Ok(())
+        } else {
+            Err(AuthCheckFailure::InvalidToken)
+        }
     }
 }
 
@@ -66,11 +113,16 @@ fn decode_salt(hex: &str) -> [u8; 32] {
 /// Hash input (in order): time-as-decimal-string | api_key | request-body | app_id | api-version | salt-bytes.
 /// salt is a 64-char lowercase hex string; it is decoded to 32 raw bytes before hashing.
 /// The output is the 128-character lowercase hex digest.
-pub fn compute_token(api_key: &str, body: &str, time: i64, app_id: &str, version: &str, salt: &str) -> String {
+pub fn compute_token(
+    api_key: &str,
+    body: &str,
+    time: i64,
+    app_id: &str,
+    version: &str,
+    salt: &str,
+) -> String {
     let salt_bytes = decode_salt(salt);
-    let mut state = blake2b_simd::Params::new()
-        .hash_length(64)
-        .to_state();
+    let mut state = blake2b_simd::Params::new().hash_length(64).to_state();
     state.update(time.to_string().as_bytes());
     state.update(api_key.as_bytes());
     state.update(body.as_bytes());
