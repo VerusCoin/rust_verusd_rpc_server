@@ -5,7 +5,7 @@ use serde_json::value::RawValue;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::time::{timeout, Duration};
 
@@ -96,7 +96,7 @@ macro_rules! request_log {
 }
 
 pub struct VerusRPC {
-    client: Client,
+    client: Arc<Mutex<Client>>,
 }
 
 impl VerusRPC {
@@ -106,7 +106,7 @@ impl VerusRPC {
             .auth(user, Some(pass))
             .build();
         Ok(VerusRPC {
-            client: Client::with_transport(transport),
+            client: Arc::new(Mutex::new(Client::with_transport(transport))),
         })
     }
 
@@ -181,14 +181,15 @@ impl VerusRPC {
             params.len()
         );
 
-        let request = self.client.build_request(method, &params);
+        let client = self.client.lock().unwrap_or_else(|e| e.into_inner());
+        let request = client.build_request(method, &params);
 
         let send_started_at = Instant::now();
         request_log!(
             trace,
             "sending request to Verus RPC backend: method={method}"
         );
-        let response = self.client.send_request(request).map_err(|e| {
+        let response = client.send_request(request).map_err(|e| {
             request_log!(
                 trace,
                 "Verus RPC backend send_request failed after {}ms: {:?}",

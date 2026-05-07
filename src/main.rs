@@ -40,8 +40,6 @@ async fn main() {
         eprintln!("Verbose request logging enabled.");
     }
 
-    let rpc = Arc::new(VerusRPC::new(&url, &user, &password).unwrap());
-
     // Load optional [api_keys] table from Secrets. If absent or empty, auth is disabled.
     let api_keys: HashMap<String, String> = secrets
         .get::<HashMap<String, String>>("api_keys")
@@ -113,8 +111,8 @@ async fn main() {
                     if request_logging {
                         eprintln!("Accepted TCP connection from {peer_addr}");
                     }
+                    let rpc = Arc::new(VerusRPC::new(&url, &user, &password).unwrap());
                     let acceptor = acceptor.clone();
-                    let rpc = rpc.clone();
                     let auth = auth.clone();
                     let usage_log = usage_log.clone();
                     tokio::spawn(async move {
@@ -161,7 +159,7 @@ async fn main() {
                     if request_logging {
                         eprintln!("Accepted TCP connection from {peer_addr}");
                     }
-                    let rpc = rpc.clone();
+                    let rpc = Arc::new(VerusRPC::new(&url, &user, &password).unwrap());
                     let auth = auth.clone();
                     let usage_log = usage_log.clone();
                     tokio::spawn(async move {
