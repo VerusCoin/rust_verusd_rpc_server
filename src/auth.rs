@@ -19,21 +19,24 @@ pub enum AuthCheckFailure {
 
 pub struct AuthState {
     api_keys: HashMap<String, String>,
-    // Each entry is (timestamp_ms, salt). Replay is rejected only when both match.
-    seen_times: Mutex<Vec<(i64, String)>>,
+    // Each entry is (app_id, timestamp_ms, salt). Replay identity is scoped to
+    // an application because different applications do not share a key.
+    seen_requests: Mutex<Vec<(String, i64, String)>>,
 }
+
+const MAX_CLOCK_SKEW_MS: u64 = 600_000;
 
 impl AuthState {
     pub fn new(api_keys: HashMap<String, String>) -> Self {
         AuthState {
             api_keys,
-            seen_times: Mutex::new(Vec::new()),
+            seen_requests: Mutex::new(Vec::new()),
         }
     }
 
     /// Returns true iff `validity_key` is the correct BLAKE2b-512 token for this
     /// (app_id, body, time, version, salt) tuple, the timestamp is within 10 minutes
-    /// of now, and the (time, salt) pair has not been seen before (replay guard).
+    /// of now, and the (app_id, time, salt) tuple has not been seen before.
     pub fn check_token(
         &self,
         validity_key: &str,
@@ -66,32 +69,68 @@ impl AuthState {
             .expect("system time before epoch")
             .as_millis() as i64;
 
-        if (now_ms - time).abs() > 600_000 {
+        if now_ms.abs_diff(time) > MAX_CLOCK_SKEW_MS {
             return Err(AuthCheckFailure::TimestampOutOfWindow {
                 now_ms,
                 request_ms: time,
-                max_skew_ms: 600_000,
+                max_skew_ms: MAX_CLOCK_SKEW_MS as i64,
             });
         }
 
+        if salt.len() != 64
+            || !salt
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
         {
-            let mut seen = self.seen_times.lock().unwrap_or_else(|e| e.into_inner());
-            if seen.iter().any(|(t, s)| *t == time && s == salt) {
-                return Err(AuthCheckFailure::Replay {
-                    timestamp_ms: time,
-                    salt: salt.to_string(),
-                });
-            }
-            seen.push((time, salt.to_string()));
-            // Prune by time only — salt is not relevant to the expiry window.
-            seen.retain(|(t, _)| (now_ms - t).abs() < 600_000);
+            return Err(AuthCheckFailure::InvalidToken);
         }
 
-        if compute_token(api_key, body, time, app_id, version, salt) == validity_key {
-            Ok(())
-        } else {
-            Err(AuthCheckFailure::InvalidToken)
+        let expected = compute_token_hash(api_key, body, time, app_id, version, salt);
+        let provided = decode_token(validity_key).ok_or(AuthCheckFailure::InvalidToken)?;
+        // blake2b_simd::Hash implements constant-time comparison against a
+        // byte slice through constant_time_eq.
+        if expected != provided[..] {
+            return Err(AuthCheckFailure::InvalidToken);
         }
+
+        // Token verification must precede replay insertion. Otherwise an
+        // unauthenticated caller can burn a legitimate (timestamp, salt).
+        let mut seen = self
+            .seen_requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        seen.retain(|(_, timestamp, _)| now_ms.abs_diff(*timestamp) <= MAX_CLOCK_SKEW_MS);
+        if seen.iter().any(|(seen_app_id, timestamp, seen_salt)| {
+            seen_app_id == app_id && *timestamp == time && seen_salt == salt
+        }) {
+            return Err(AuthCheckFailure::Replay {
+                timestamp_ms: time,
+                salt: salt.to_string(),
+            });
+        }
+        seen.push((app_id.to_string(), time, salt.to_string()));
+        Ok(())
+    }
+}
+
+fn decode_token(hex: &str) -> Option<[u8; 64]> {
+    if hex.len() != 128 {
+        return None;
+    }
+    let mut out = [0u8; 64];
+    for (index, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+        let high = lower_hex_value(chunk[0])?;
+        let low = lower_hex_value(chunk[1])?;
+        out[index] = (high << 4) | low;
+    }
+    Some(out)
+}
+
+fn lower_hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
     }
 }
 
@@ -121,6 +160,19 @@ pub fn compute_token(
     version: &str,
     salt: &str,
 ) -> String {
+    compute_token_hash(api_key, body, time, app_id, version, salt)
+        .to_hex()
+        .to_string()
+}
+
+fn compute_token_hash(
+    api_key: &str,
+    body: &str,
+    time: i64,
+    app_id: &str,
+    version: &str,
+    salt: &str,
+) -> blake2b_simd::Hash {
     let salt_bytes = decode_salt(salt);
     let mut state = blake2b_simd::Params::new().hash_length(64).to_state();
     state.update(time.to_string().as_bytes());
@@ -129,5 +181,5 @@ pub fn compute_token(
     state.update(app_id.as_bytes());
     state.update(version.as_bytes());
     state.update(&salt_bytes);
-    state.finalize().to_hex().to_string()
+    state.finalize()
 }

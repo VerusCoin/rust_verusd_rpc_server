@@ -230,7 +230,9 @@ mod tests {
         assert_eq!(snapshot["app_ids"], json!(["valu-mobile", "verus-mobile"]));
         assert_eq!(snapshot["apps"]["verus-mobile"]["counts"]["last_hour"], 0);
         assert_eq!(snapshot["apps"]["valu-mobile"]["counts"]["last_30_days"], 0);
-        assert!(snapshot["apps"]["verus-mobile"].get("run_buckets").is_none());
+        assert!(snapshot["apps"]["verus-mobile"]
+            .get("run_buckets")
+            .is_none());
     }
 
     #[test]
@@ -255,7 +257,9 @@ mod tests {
         log.flush_snapshot_at(base + 30_000).unwrap();
         let snapshot = read_json(log.log_path());
         assert_eq!(snapshot["apps"]["verus-mobile"]["counts"]["last_hour"], 1);
-        assert!(snapshot["apps"]["verus-mobile"].get("run_buckets").is_none());
+        assert!(snapshot["apps"]["verus-mobile"]
+            .get("run_buckets")
+            .is_none());
     }
 
     #[test]
@@ -271,7 +275,10 @@ mod tests {
 
         {
             let inner = log.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let buckets = inner.current_run_buckets_by_app.get("verus-mobile").unwrap();
+            let buckets = inner
+                .current_run_buckets_by_app
+                .get("verus-mobile")
+                .unwrap();
             assert_eq!(buckets.len(), 1);
             assert!(buckets.contains_key(&bucket_start_ms(fresh_bucket_ms)));
             assert!(!buckets.contains_key(&bucket_start_ms(stale_bucket_ms)));
@@ -279,7 +286,12 @@ mod tests {
 
         log.flush_snapshot_at(base).unwrap();
         let snapshot = read_json(log.log_path());
-        assert_eq!(snapshot["apps"]["verus-mobile"]["counts"]["last_30_days"], 1);
-        assert!(snapshot["apps"]["verus-mobile"].get("run_buckets").is_none());
+        assert_eq!(
+            snapshot["apps"]["verus-mobile"]["counts"]["last_30_days"],
+            1
+        );
+        assert!(snapshot["apps"]["verus-mobile"]
+            .get("run_buckets")
+            .is_none());
     }
 }

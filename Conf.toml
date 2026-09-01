@@ -1,5 +1,49 @@
 tls_enabled = false
+auth_enabled = true
 logging = false
 rpc_url = "127.0.0.1:18843"
 server_port = 8000
 server_addr = "127.0.0.1"
+
+# Optional plaintext listener for local development. This listener is always
+# bound to both IPv4 and IPv6 loopback; omitting the setting disables it.
+# Authentication and RPC request policy checks still apply.
+# localhost_http_port = 8001
+
+# Address-blocklist checks use direct addresses by default and never make
+# implicit daemon calls. Set this to true to permit friendly identity selectors
+# and identity-valued updateidentity fields, including root targets; those names
+# are resolved with getvdxfid before comparison with a non-empty address
+# blocklist. This does not disable the public getvdxfid RPC.
+resolve_identity_names_for_blocklist = false
+
+# Opt-in input policy for updateidentity. When enabled, the name field must be
+# an unchanged canonical leaf name no longer than 64 UTF-8 bytes. It may not be
+# a dotted or @-qualified selector. Disabled by default for daemon-compatible
+# handling of the broader updateidentity name syntax.
+require_canonical_identity_leaf_names = false
+
+# Additional method gate applied after the built-in parameter-aware allowlist.
+# An empty array disables this additional gate.
+method_whitelist = [
+    "estimateconversion",
+    "fundrawtransaction",
+    "getaddressbalance",
+    "getaddressdeltas",
+    "getaddressmempool",
+    "getaddressutxos",
+    "getblock",
+    "getblockhash",
+    "getcurrency",
+    "getcurrencyconverters",
+    "getidentitieswithaddress",
+    "getidentity",
+    "getidentitycontent",
+    "getinfo",
+    "getrawtransaction",
+    "getvdxfid",
+    "listcurrencies",
+    "sendcurrency",
+    "sendrawtransaction",
+    "updateidentity",
+]

@@ -4,16 +4,20 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-hyper = { version = "0.14", features = ["full"] }
+hyper = { version = "0.14.32", default-features = false, features = ["client", "server", "http1", "tcp"] }
 tokio = { version = "1", features = ["full"] }
 serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
 jsonrpc = "0.12"
-config = "0.13"
-rustls = "0.21"
-rustls-pemfile = "1"
-tokio-rustls = "0.24"
+config = { version = "0.13", default-features = false, features = ["toml"] }
+rustls = "0.23"
+rustls-pki-types = { version = "1", features = ["std"] }
+tokio-rustls = "0.26"
 blake2b_simd = "1"
+bs58 = { version = "0.5", features = ["check"] }
+ripemd = "0.1"
+sha2 = "0.10"
 
 [dev-dependencies]
-rcgen = "0.11"
+rcgen = "0.14"
 tempfile = "3"

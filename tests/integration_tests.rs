@@ -1,7 +1,8 @@
 use hyper::{server::conn::Http, service::service_fn, Body, Request, StatusCode};
 use rust_verusd_rpc_server::auth::{compute_token, AuthState};
 use rust_verusd_rpc_server::{
-    handle_req, load_tls_config, read_body_limited, ReadBodyError, VerusRPC, MAX_BODY_BYTES,
+    handle_localhost_req_with_logging, handle_req, load_tls_config, read_body_limited,
+    ReadBodyError, RequestLogConfig, VerusRPC, MAX_BODY_BYTES,
 };
 use std::{
     collections::HashMap,
@@ -31,24 +32,17 @@ async fn spawn_plain_server(rpc: Arc<VerusRPC>, auth: Option<Arc<AuthState>>) ->
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((tcp, _)) => {
-                    let rpc = rpc.clone();
-                    let auth = auth.clone();
-                    tokio::spawn(async move {
-                        let _ = Http::new()
-                            .serve_connection(
-                                tcp,
-                                service_fn(move |req| {
-                                    handle_req(req, rpc.clone(), auth.clone(), None)
-                                }),
-                            )
-                            .await;
-                    });
-                }
-                Err(_) => break,
-            }
+        while let Ok((tcp, _)) = listener.accept().await {
+            let rpc = rpc.clone();
+            let auth = auth.clone();
+            tokio::spawn(async move {
+                let _ = Http::new()
+                    .serve_connection(
+                        tcp,
+                        service_fn(move |req| handle_req(req, rpc.clone(), auth.clone(), None)),
+                    )
+                    .await;
+            });
         }
     });
     addr
@@ -278,10 +272,10 @@ async fn http_body_under_limit_no_content_length_accepted() {
     assert_ne!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
-// ── CORS / OPTIONS ────────────────────────────────────────────────────────────
+// ── HTTP method, route, and CORS policy ───────────────────────────────────────
 
 #[tokio::test]
-async fn options_returns_200_with_cors_headers() {
+async fn options_is_rejected_without_cors_headers() {
     let addr = spawn_plain_server(dummy_rpc(), None).await;
     let resp = hyper::Client::new()
         .request(
@@ -291,18 +285,204 @@ async fn options_returns_200_with_cors_headers() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(resp.headers()["access-control-allow-origin"], "*");
-    assert!(resp.headers().contains_key("access-control-allow-methods"));
-    assert!(resp.headers().contains_key("access-control-allow-headers"));
-    assert!(resp.headers().contains_key("access-control-max-age"));
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(resp.headers()[hyper::header::ALLOW], "POST");
+    assert!(!resp.headers().contains_key("access-control-allow-origin"));
 }
 
 #[tokio::test]
-async fn post_response_includes_cors_origin_header() {
+async fn post_response_does_not_include_cors_headers() {
     let addr = spawn_plain_server(dummy_rpc(), None).await;
     let resp = post_json(addr, "{\"method\":\"getinfo\",\"params\":[]}").await;
-    assert_eq!(resp.headers()["access-control-allow-origin"], "*");
+    assert!(!resp.headers().contains_key("access-control-allow-origin"));
+    assert!(!resp.headers().contains_key("access-control-allow-methods"));
+    assert!(!resp.headers().contains_key("access-control-allow-headers"));
+}
+
+#[tokio::test]
+async fn localhost_listener_accepts_local_preflight_with_exact_origin() {
+    for origin in [
+        "http://localhost:3000",
+        "https://127.0.0.1:8443",
+        "http://[::1]:5173",
+    ] {
+        let req = Request::options("/")
+            .header(hyper::header::ORIGIN, origin)
+            .header(hyper::header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .header(
+                hyper::header::ACCESS_CONTROL_REQUEST_HEADERS,
+                "content-type, x-app-id, x-timestamp, x-auth-token, x-vrpc-api-version, x-salt",
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = handle_localhost_req_with_logging(
+            req,
+            dummy_rpc(),
+            None,
+            None,
+            RequestLogConfig::disabled(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT, "origin={origin}");
+        assert_eq!(
+            resp.headers()[hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            origin,
+            "origin={origin}"
+        );
+        assert_eq!(
+            resp.headers()[hyper::header::ACCESS_CONTROL_ALLOW_METHODS],
+            "POST"
+        );
+        assert!(!resp
+            .headers()
+            .contains_key(hyper::header::ACCESS_CONTROL_ALLOW_CREDENTIALS));
+    }
+}
+
+#[tokio::test]
+async fn localhost_listener_post_response_echoes_local_origin() {
+    let origin = "http://localhost:5173";
+    let req = Request::post("/")
+        .header(hyper::header::ORIGIN, origin)
+        .body(Body::from("not json"))
+        .unwrap();
+
+    let resp = handle_localhost_req_with_logging(
+        req,
+        dummy_rpc(),
+        None,
+        None,
+        RequestLogConfig::disabled(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()[hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        origin
+    );
+    assert_eq!(resp.headers()[hyper::header::VARY], "Origin");
+    assert!(!resp
+        .headers()
+        .contains_key(hyper::header::ACCESS_CONTROL_ALLOW_CREDENTIALS));
+}
+
+#[tokio::test]
+async fn localhost_listener_rejects_nonlocal_browser_origin() {
+    for origin in [
+        "https://example.com",
+        "http://localhost.example.com",
+        "http://localhost@evil.example",
+        "null",
+    ] {
+        let req = Request::post("/")
+            .header(hyper::header::ORIGIN, origin)
+            .body(Body::from("not json"))
+            .unwrap();
+
+        let resp = handle_localhost_req_with_logging(
+            req,
+            dummy_rpc(),
+            None,
+            None,
+            RequestLogConfig::disabled(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "origin={origin}");
+        assert!(
+            !resp
+                .headers()
+                .contains_key(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            "origin={origin}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn localhost_listener_rejects_unapproved_preflight_headers() {
+    let req = Request::options("/")
+        .header(hyper::header::ORIGIN, "http://localhost:3000")
+        .header(hyper::header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+        .header(
+            hyper::header::ACCESS_CONTROL_REQUEST_HEADERS,
+            "content-type, authorization",
+        )
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = handle_localhost_req_with_logging(
+        req,
+        dummy_rpc(),
+        None,
+        None,
+        RequestLogConfig::disabled(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(!resp
+        .headers()
+        .contains_key(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN));
+}
+
+#[tokio::test]
+async fn localhost_listener_does_not_bypass_authentication() {
+    let req = Request::post("/")
+        .header(hyper::header::ORIGIN, "http://localhost:3000")
+        .body(Body::from(r#"{"method":"getinfo","params":[]}"#))
+        .unwrap();
+
+    let resp = handle_localhost_req_with_logging(
+        req,
+        dummy_rpc(),
+        Some(make_auth("test-app", "test-key")),
+        None,
+        RequestLogConfig::disabled(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        resp.headers()[hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        "http://localhost:3000"
+    );
+    assert!(body_string(resp)
+        .await
+        .contains("X-VRPC-API-Version: 2 required"));
+}
+
+#[tokio::test]
+async fn get_is_rejected() {
+    let addr = spawn_plain_server(dummy_rpc(), None).await;
+    let resp = hyper::Client::new()
+        .get(format!("http://{}", addr).parse().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn post_to_non_rpc_route_is_rejected() {
+    let addr = spawn_plain_server(dummy_rpc(), None).await;
+    for path in ["/rpc", "/?query=not-allowed"] {
+        let resp = hyper::Client::new()
+            .request(
+                Request::post(format!("http://{addr}{path}"))
+                    .body(Body::from("{\"method\":\"getinfo\",\"params\":[]}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
 }
 
 // ── Input validation ──────────────────────────────────────────────────────────
@@ -390,7 +570,7 @@ async fn sendcurrency_without_simulation_flag_blocked() {
     let addr = spawn_plain_server(dummy_rpc(), None).await;
     let resp = post_json(
         addr,
-        r#"{"method":"sendcurrency","params":["*",[],0,0.001,false]}"#,
+        r#"{"method":"sendcurrency","params":["*",[{"currency":"VRSC","amount":1.25,"address":"Rdestination"}],1,0.0001,false]}"#,
     )
     .await;
     let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
@@ -402,7 +582,7 @@ async fn sendcurrency_with_simulation_flag_passes_allowlist() {
     let addr = spawn_plain_server(dummy_rpc(), None).await;
     let resp = post_json(
         addr,
-        r#"{"method":"sendcurrency","params":["*",[],0,0.001,true]}"#,
+        r#"{"method":"sendcurrency","params":["*",[{"currency":"VRSC","amount":1.25,"address":"Rdestination"}],1,0.0001,true]}"#,
     )
     .await;
     let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
@@ -473,12 +653,13 @@ fn tls_config_empty_files_fail() {
 
 #[test]
 fn tls_config_valid_self_signed_succeeds() {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let cert_path = dir.path().join("cert.pem");
     let key_path = dir.path().join("key.pem");
-    std::fs::write(&cert_path, cert.serialize_pem().unwrap()).unwrap();
-    std::fs::write(&key_path, cert.serialize_private_key_pem()).unwrap();
+    std::fs::write(&cert_path, cert.pem()).unwrap();
+    std::fs::write(&key_path, signing_key.serialize_pem()).unwrap();
 
     let result = load_tls_config(cert_path.to_str().unwrap(), key_path.to_str().unwrap());
     assert!(result.is_ok(), "load_tls_config failed: {:?}", result.err());
@@ -486,12 +667,13 @@ fn tls_config_valid_self_signed_succeeds() {
 
 #[test]
 fn tls_config_swapped_cert_and_key_fails() {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let cert_path = dir.path().join("cert.pem");
     let key_path = dir.path().join("key.pem");
-    std::fs::write(&cert_path, cert.serialize_pem().unwrap()).unwrap();
-    std::fs::write(&key_path, cert.serialize_private_key_pem()).unwrap();
+    std::fs::write(&cert_path, cert.pem()).unwrap();
+    std::fs::write(&key_path, signing_key.serialize_pem()).unwrap();
 
     // cert where key expected and vice versa → must fail
     assert!(load_tls_config(key_path.to_str().unwrap(), cert_path.to_str().unwrap()).is_err());
@@ -502,14 +684,15 @@ fn tls_config_swapped_cert_and_key_fails() {
 #[tokio::test]
 async fn tls_server_accepts_https_connection_and_returns_rpc_response() {
     // 1. Generate self-signed certificate
-    let rcgen_cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-    let cert_der = rcgen_cert.serialize_der().unwrap();
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let cert_der = cert.der().clone();
 
     let dir = tempfile::tempdir().unwrap();
     let cert_path = dir.path().join("cert.pem");
     let key_path = dir.path().join("key.pem");
-    std::fs::write(&cert_path, rcgen_cert.serialize_pem().unwrap()).unwrap();
-    std::fs::write(&key_path, rcgen_cert.serialize_private_key_pem()).unwrap();
+    std::fs::write(&cert_path, cert.pem()).unwrap();
+    std::fs::write(&key_path, signing_key.serialize_pem()).unwrap();
 
     // 2. Start TLS server
     let tls_config =
@@ -534,16 +717,15 @@ async fn tls_server_accepts_https_connection_and_returns_rpc_response() {
 
     // 3. Build TLS client that trusts the self-signed cert
     let mut root_store = rustls::RootCertStore::empty();
-    root_store.add(&rustls::Certificate(cert_der)).unwrap();
+    root_store.add(cert_der).unwrap();
     let client_config = rustls::ClientConfig::builder()
-        .with_safe_defaults()
         .with_root_certificates(root_store)
         .with_no_client_auth();
     let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
 
     // 4. TCP + TLS handshake
     let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let server_name = rustls::ServerName::try_from("localhost").unwrap();
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
     let tls_stream = connector.connect(server_name, tcp).await.unwrap();
 
     // 5. HTTP/1.1 over TLS via hyper's low-level conn API
