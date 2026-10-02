@@ -590,6 +590,44 @@ async fn sendcurrency_with_simulation_flag_passes_allowlist() {
 }
 
 #[tokio::test]
+async fn sendcurrency_with_refundto_quote_and_template_reach_backend() {
+    let addr = spawn_plain_server(dummy_rpc(), None).await;
+    for amount in [0.0, 1.25] {
+        let request = serde_json::json!({
+            "method": "sendcurrency",
+            "params": ["*", [{
+                "currency": "VRSC",
+                "amount": amount,
+                "address": "Rdestination",
+                "refundto": "Rrefund"
+            }], 1, 0.0001, true]
+        });
+        let resp = post_json(addr, &request.to_string()).await;
+        let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        // The unavailable backend returns an internal error after validation succeeds.
+        assert_eq!(v["error"]["code"], -32603, "amount={amount}: {v}");
+    }
+}
+
+#[tokio::test]
+async fn getcurrencyconverters_positional_arguments_reach_backend() {
+    let addr = spawn_plain_server(dummy_rpc(), None).await;
+    for currencies in [
+        vec!["iCurrency"],
+        vec!["VRSC", "iCurrency"],
+        vec!["VRSC"; 10],
+    ] {
+        let request = serde_json::json!({
+            "method": "getcurrencyconverters",
+            "params": currencies
+        });
+        let resp = post_json(addr, &request.to_string()).await;
+        let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(v["error"]["code"], -32603, "{request}: {v}");
+    }
+}
+
+#[tokio::test]
 async fn signdata_with_address_field_blocked() {
     let addr = spawn_plain_server(dummy_rpc(), None).await;
     let resp = post_json(

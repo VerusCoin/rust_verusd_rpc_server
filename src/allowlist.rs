@@ -216,10 +216,22 @@ fn validate_get_block(params: &[Value]) -> bool {
 }
 
 fn validate_get_currency_converters(params: &[Value]) -> bool {
+    if !params.iter().any(|param| {
+        param
+            .as_str()
+            .is_some_and(|string| string.trim_start().starts_with(['{', '[']))
+    }) {
+        return (1..=10).contains(&params.len())
+            && params
+                .iter()
+                .all(|currency| is_bounded_string(currency, MAX_IDENTIFIER_LENGTH));
+    }
+
+    // Query-like strings must pass the query schema, never fall back to identifiers.
     let [Value::String(query)] = params else {
         return false;
     };
-    if query.len() > MAX_EMBEDDED_QUERY_BYTES {
+    if query.len() > MAX_EMBEDDED_QUERY_BYTES || !query.trim_start().starts_with('{') {
         return false;
     }
 
@@ -399,6 +411,7 @@ fn validate_send_currency(params: &[Value]) -> bool {
             "currency",
             "amount",
             "address",
+            "refundto",
             "exportto",
             "convertto",
             "feecurrency",
@@ -413,6 +426,7 @@ fn validate_send_currency(params: &[Value]) -> bool {
         && output
             .get("address")
             .is_some_and(|value| is_bounded_string(value, MAX_IDENTIFIER_LENGTH))
+        && is_optional_bounded_string(output, "refundto", MAX_IDENTIFIER_LENGTH)
         && is_optional_bounded_string(output, "exportto", MAX_IDENTIFIER_LENGTH)
         && is_optional_bounded_string(output, "convertto", MAX_IDENTIFIER_LENGTH)
         && is_optional_bounded_string(output, "feecurrency", MAX_IDENTIFIER_LENGTH)

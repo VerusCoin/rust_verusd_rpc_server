@@ -64,7 +64,13 @@ cargo build
      derivable canonical subset are still rejected because their target cannot
      be checked safely. A derivable parented request must include the matching
      `identityaddress`.
-   - Embedded `getcurrencyconverters` JSON rejects duplicate object keys.
+   - `getcurrencyconverters` accepts 1–10 positional currency identifiers, each
+     a non-empty string of at most 256 UTF-8 bytes, or a single embedded JSON
+     invoice query. Embedded queries retain strict field validation and reject
+     duplicate object keys; malformed queries cannot fall back to identifiers.
+   - Template-only `sendcurrency` outputs accept optional `refundto` using the
+     same bounds as other optional identifiers: `null` or a non-empty string
+     of at most 256 UTF-8 bytes.
    - The public JSON-RPC endpoint is `POST /` and does not enable browser CORS.
    - `localhost_http_port` enables a separate plaintext testing listener on
      both `127.0.0.1` and `::1`. The checked-in value, `8001`, accepts requests

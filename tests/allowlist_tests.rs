@@ -218,6 +218,112 @@ fn sendcurrency_missing_simulation_flag_blocked() {
 }
 
 #[test]
+fn sendcurrency_refundto_accepts_fee_quotes_and_transaction_templates() {
+    for amount in [0.0, 1.25] {
+        for refundto in [
+            None,
+            Some(Value::Null),
+            Some(json!("Rrefund")),
+            Some(json!("r".repeat(256))),
+            Some(json!("é".repeat(128))),
+        ] {
+            let mut output = json!({
+                "currency": "VRSC",
+                "amount": amount,
+                "address": "Rdestination"
+            });
+            if let Some(refundto) = refundto {
+                output["refundto"] = refundto;
+            }
+            assert!(is_method_allowed(
+                "sendcurrency",
+                &[
+                    raw_json(json!("Rsource")),
+                    raw_json(json!([output])),
+                    raw("1"),
+                    raw("0.0001"),
+                    raw("true"),
+                ]
+            ));
+        }
+    }
+}
+
+#[test]
+fn sendcurrency_refundto_rejects_empty_oversized_and_non_string_values() {
+    for refundto in [
+        json!(""),
+        json!("r".repeat(257)),
+        json!("é".repeat(129)),
+        json!(1),
+        json!(true),
+        json!([]),
+        json!({}),
+    ] {
+        assert!(!is_method_allowed(
+            "sendcurrency",
+            &[
+                raw_json(json!("*")),
+                raw_json(json!([{
+                    "currency": "VRSC",
+                    "amount": 0,
+                    "address": "Rdestination",
+                    "refundto": refundto
+                }])),
+                raw("1"),
+                raw("0.0001"),
+                raw("true"),
+            ]
+        ));
+    }
+}
+
+#[test]
+fn sendcurrency_refundto_preserves_template_restrictions() {
+    let output = json!({
+        "currency": "VRSC",
+        "amount": 1.25,
+        "address": "Rdestination",
+        "refundto": "Rrefund"
+    });
+    let valid = vec![
+        json!("*"),
+        json!([output]),
+        json!(1),
+        json!(0.0001),
+        json!(true),
+    ];
+    let mut unknown_output = output.clone();
+    unknown_output["memo"] = json!("unsupported");
+
+    for (index, replacement) in [
+        (0, json!("")),
+        (1, json!([output.clone(), output])),
+        (1, json!([unknown_output])),
+        (2, json!(0)),
+        (3, json!(0.001)),
+        (4, json!(false)),
+        (4, json!("true")),
+    ] {
+        let mut params = valid.clone();
+        params[index] = replacement;
+        let params: Vec<_> = params.into_iter().map(raw_json).collect();
+        assert!(!is_method_allowed("sendcurrency", &params));
+    }
+
+    for extra in [false, true] {
+        let mut params = valid.clone();
+        if extra {
+            params.push(Value::Null);
+        } else {
+            params.pop();
+        }
+        let params: Vec<_> = params.into_iter().map(raw_json).collect();
+        assert!(!is_method_allowed("sendcurrency", &params));
+    }
+}
+
+#[test]
 fn registeridentity_simulation_true_allowed() {
     assert!(is_method_allowed(
         "registeridentity",
@@ -663,16 +769,120 @@ fn updateidentity_requires_mobile_shape_and_known_top_level_fields() {
 }
 
 #[test]
+fn getcurrencyconverters_accepts_bounded_positional_currencies() {
+    for currencies in [
+        vec![json!(IADDR)],
+        vec![json!("VRSC"); 10],
+        vec![json!("c".repeat(256))],
+        vec![json!("é".repeat(128))],
+    ] {
+        let params: Vec<_> = currencies.into_iter().map(raw_json).collect();
+        assert!(is_method_allowed("getcurrencyconverters", &params));
+    }
+}
+
+#[test]
+fn getcurrencyconverters_rejects_invalid_positional_currencies() {
+    assert!(!is_method_allowed("getcurrencyconverters", &[]));
+    let too_many: Vec<_> = (0..11).map(|_| raw_json(json!("VRSC"))).collect();
+    assert!(!is_method_allowed("getcurrencyconverters", &too_many));
+
+    for invalid in [
+        json!(""),
+        json!("c".repeat(257)),
+        json!("é".repeat(129)),
+        Value::Null,
+        json!(1),
+        json!(true),
+        json!(["VRSC"]),
+        json!({"currency": "VRSC"}),
+    ] {
+        for prefix in [vec![], vec![raw_json(json!("VRSC"))]] {
+            let mut params = prefix;
+            params.push(raw_json(invalid.clone()));
+            assert!(!is_method_allowed("getcurrencyconverters", &params));
+        }
+    }
+}
+
+#[test]
+fn getcurrencyconverters_preserves_json_query_validation() {
+    let query = json!({
+        "convertto": "iDestination",
+        "fromcurrency": [{"currency": "VRSC"}],
+        "amount": 1,
+        "slippage": 1
+    });
+    let mut long_query = query.clone();
+    long_query["fromcurrency"] = json!(vec![json!({"currency": "VRSC"}); 10]);
+    assert!(long_query.to_string().len() > 256);
+    for valid in [&query, &long_query] {
+        assert!(is_method_allowed(
+            "getcurrencyconverters",
+            &[raw_json(json!(format!(" \n\t{valid}")))]
+        ));
+    }
+
+    for (field, value) in [
+        ("unknown", json!(true)),
+        ("convertto", json!("")),
+        ("convertto", json!("c".repeat(257))),
+        ("amount", json!(-1)),
+        ("amount", json!("1")),
+        ("slippage", json!(-1)),
+        (
+            "fromcurrency",
+            json!([{"currency": "VRSC", "unknown": true}]),
+        ),
+        ("fromcurrency", json!([{"currency": ""}])),
+        (
+            "fromcurrency",
+            json!(vec![json!({"currency": "VRSC"}); 101]),
+        ),
+    ] {
+        let mut invalid = query.clone();
+        invalid[field] = value;
+        assert!(!is_method_allowed(
+            "getcurrencyconverters",
+            &[raw_json(json!(format!(" \n\t{invalid}")))]
+        ));
+    }
+
+    for (query_like, valid_query) in [
+        (query.to_string(), true),
+        ("{}".to_string(), false),
+        ("{malformed".to_string(), false),
+        ("[\"VRSC\"]".to_string(), false),
+        ("[malformed".to_string(), false),
+    ] {
+        for query_like in [query_like.clone(), format!(" \n\t{query_like}")] {
+            assert_eq!(
+                is_method_allowed("getcurrencyconverters", &[raw_json(json!(query_like))]),
+                valid_query
+            );
+            for params in [
+                vec![raw_json(json!(query_like)), raw_json(json!("VRSC"))],
+                vec![raw_json(json!("VRSC")), raw_json(json!(query_like))],
+            ] {
+                assert!(!is_method_allowed("getcurrencyconverters", &params));
+            }
+        }
+    }
+}
+
+#[test]
 fn getcurrencyconverters_rejects_duplicate_keys() {
     let duplicate_root = r#"{"convertto":"iDestination","fromcurrency":[{"currency":"VRSC"}],"amount":1,"amount":2,"slippage":1}"#;
     let duplicate_nested = r#"{"convertto":"iDestination","fromcurrency":[{"currency":"VRSC","currency":"VRSCTEST"}],"amount":1,"slippage":1}"#;
     let escaped_duplicate = r#"{"convertto":"iDestination","fromcurrency":[{"currency":"VRSC"}],"amount":1,"\u0061mount":2,"slippage":1}"#;
 
     for query in [duplicate_root, duplicate_nested, escaped_duplicate] {
-        assert!(!is_method_allowed(
-            "getcurrencyconverters",
-            &[raw_json(json!(query))]
-        ));
+        for query in [query.to_string(), format!(" \n\t{query}")] {
+            assert!(!is_method_allowed(
+                "getcurrencyconverters",
+                &[raw_json(json!(query))]
+            ));
+        }
     }
 }
 
