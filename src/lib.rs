@@ -313,7 +313,7 @@ impl RequestPolicy {
             }
         }
 
-        if method == "getrawtransaction" {
+        if matches!(method, "getrawtransaction" | "gettxout") {
             if let Some(txid) = params.first().and_then(Value::as_str) {
                 if self.txid_blocklist.contains(&txid.to_ascii_lowercase()) {
                     return Err(RequestPolicyRejection::Blocked);
@@ -548,7 +548,7 @@ fn address_lookup_values(method: &str, params: &[Value]) -> Vec<AddressLookupVal
                 ));
             }
         }
-        "getidentity" | "getidentitycontent" => {
+        "getidentity" | "getidentitycontent" | "getidentityhistory" => {
             if let Some(address) = params.first().and_then(Value::as_str) {
                 values.push(AddressLookupValue::new(
                     address,

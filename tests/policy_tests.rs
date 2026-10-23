@@ -154,8 +154,10 @@ fn checked_in_conf_whitelists_exact_mobile_rpc_surface() {
         "getidentitieswithaddress",
         "getidentity",
         "getidentitycontent",
+        "getidentityhistory",
         "getinfo",
         "getrawtransaction",
+        "gettxout",
         "getvdxfid",
         "listcurrencies",
         "sendcurrency",
@@ -290,6 +292,7 @@ fn direct_address_is_blocked_for_every_configured_lookup_method() {
         ),
         ("getidentity", json!([BLOCKED_IADDR])),
         ("getidentitycontent", json!([BLOCKED_IADDR])),
+        ("getidentityhistory", json!([BLOCKED_IADDR, 0, 100])),
     ];
 
     for (method, params) in requests {
@@ -318,7 +321,7 @@ fn direct_address_is_blocked_for_every_configured_lookup_method() {
 #[test]
 fn safe_direct_identity_address_is_allowed_without_resolution() {
     let policy = policy(vec![BLOCKED_IADDR], Vec::new());
-    for method in ["getidentity", "getidentitycontent"] {
+    for method in ["getidentity", "getidentitycontent", "getidentityhistory"] {
         let params = json!([SAFE_IADDR]);
         assert_eq!(
             policy.check_blocklists(
@@ -337,7 +340,7 @@ fn safe_direct_identity_address_is_allowed_without_resolution() {
 #[test]
 fn human_readable_identity_is_resolved_with_getvdxfid_semantics() {
     let policy = policy(vec![BLOCKED_IADDR], Vec::new());
-    for method in ["getidentity", "getidentitycontent"] {
+    for method in ["getidentity", "getidentitycontent", "getidentityhistory"] {
         let params = json!(["alice"]);
         let mut called = false;
         let result = policy.check_blocklists(method, params.as_array().unwrap(), |identity_name| {
@@ -381,7 +384,7 @@ fn human_readable_identity_resolution_fails_closed() {
 fn identity_names_require_direct_i_addresses_when_resolution_is_disabled() {
     let policy = policy_without_identity_name_resolution(vec![BLOCKED_IADDR], Vec::new());
 
-    for method in ["getidentity", "getidentitycontent"] {
+    for method in ["getidentity", "getidentitycontent", "getidentityhistory"] {
         let blocked = json!([BLOCKED_IADDR]);
         assert_eq!(
             policy.check_blocklists(
@@ -777,6 +780,18 @@ fn txid_blocklist_is_case_insensitive() {
             |_| Err(()),
         ),
         Err(RequestPolicyRejection::Blocked)
+    );
+    let txout_params = json!([BLOCKED_TXID.to_ascii_uppercase(), 0, true]);
+    assert_eq!(
+        policy.check_blocklists("gettxout", txout_params.as_array().unwrap(), |_| Err(())),
+        Err(RequestPolicyRejection::Blocked)
+    );
+    let safe_txout_params = json!(["0".repeat(64), 0, true]);
+    assert_eq!(
+        policy.check_blocklists("gettxout", safe_txout_params.as_array().unwrap(), |_| Err(
+            ()
+        )),
+        Ok(())
     );
     let block_params = json!([BLOCKED_TXID]);
     assert_eq!(

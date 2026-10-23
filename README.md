@@ -38,14 +38,16 @@ cargo build
 
    - `method_whitelist` is an additional exact method gate. An empty list falls
      back to the built-in allowlist; the checked-in configuration contains the
-     20 RPCs used by Verus Mobile.
+     22 RPCs used by Verus Mobile, including identity registration.
+     `getblock` accepts omitted verbosity, booleans, or integer `0`/`1`.
    - `auth_enabled = true` requires a non-empty `[api_keys]` table in
      `Secrets.toml`; startup fails when it is missing or invalid.
    - `address_blocklist` and `txid_blocklist` live in `Secrets.toml`. An empty
      address blocklist performs no address extraction or identity-name lookup.
+     The transaction blocklist applies to `getrawtransaction` and `gettxout`.
    - `resolve_identity_names_for_blocklist` defaults to `false`. With a
-     non-empty address blocklist, `getidentity` and `getidentitycontent` must
-     use direct i-addresses, and root `updateidentity` requests are rejected
+     non-empty address blocklist, `getidentity`, `getidentitycontent`, and
+     `getidentityhistory` must use direct i-addresses. Root `updateidentity` requests are rejected
      because their target cannot be verified locally. Set it to `true` to
      resolve those selectors, root targets, and other identity-valued
      `updateidentity` fields through the daemon before comparison. This setting

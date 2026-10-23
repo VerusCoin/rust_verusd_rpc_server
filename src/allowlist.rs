@@ -213,6 +213,8 @@ fn validate_fund_raw_transaction(params: &[Value]) -> bool {
 fn validate_get_block(params: &[Value]) -> bool {
     matches!(params, [block] if is_bounded_string(block, 128))
         || matches!(params, [block, Value::Bool(_)] if is_bounded_string(block, 128))
+        || matches!(params, [block, verbosity]
+            if is_bounded_string(block, 128) && matches!(verbosity.as_u64(), Some(0 | 1)))
 }
 
 fn validate_get_currency_converters(params: &[Value]) -> bool {
@@ -296,7 +298,11 @@ fn validate_get_identity(params: &[Value]) -> bool {
         return false;
     }
 
-    params.get(1).is_none_or(is_nonnegative_integer)
+    // The daemon uses exactly -1 to include pending identity updates. Keep
+    // other negative heights invalid and do not relax proof-height validation.
+    params
+        .get(1)
+        .is_none_or(|height| height.as_i64() == Some(-1) || is_nonnegative_integer(height))
         && params.get(2).is_none_or(Value::is_boolean)
         && params.get(3).is_none_or(is_nonnegative_integer)
 }

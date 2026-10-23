@@ -138,6 +138,64 @@ fn getblock_quoted_numeric_string_allowed() {
 }
 
 #[test]
+fn getblock_boolean_and_numeric_verbosity_allowed() {
+    for block in [TXID, "12345"] {
+        for verbosity in [json!(false), json!(true), json!(0), json!(1)] {
+            assert!(
+                is_method_allowed(
+                    "getblock",
+                    &[raw_json(json!(block)), raw_json(verbosity.clone())]
+                ),
+                "block={block}, verbosity={verbosity}"
+            );
+        }
+    }
+}
+
+#[test]
+fn getblock_invalid_verbosity_and_extra_params_blocked() {
+    for verbosity in [
+        json!(-1),
+        json!(2),
+        json!(1.0),
+        json!(0.5),
+        json!("1"),
+        json!(null),
+        json!({}),
+        json!([]),
+    ] {
+        assert!(
+            !is_method_allowed(
+                "getblock",
+                &[raw_json(json!(TXID)), raw_json(verbosity.clone())]
+            ),
+            "verbosity={verbosity}"
+        );
+    }
+    assert!(!is_method_allowed(
+        "getblock",
+        &[raw_json(json!(TXID)), raw("1"), raw("true")]
+    ));
+    assert!(!is_method_allowed("getblock", &[raw("1")]));
+    assert!(!is_method_allowed(
+        "getblock",
+        &[raw_json(json!("x".repeat(129))), raw("1")]
+    ));
+}
+
+#[test]
+fn identity_registration_read_parameters_allowed() {
+    assert!(is_method_allowed(
+        "getidentityhistory",
+        &[raw_json(json!(IADDR)), raw("0"), raw("100")]
+    ));
+    assert!(is_method_allowed(
+        "gettxout",
+        &[raw_json(json!(TXID)), raw("0"), raw("true")]
+    ));
+}
+
+#[test]
 fn getblock_raw_integer_blocked() {
     // A raw integer bypasses handle()'s conversion and fails the "str" type check.
     assert!(!is_method_allowed("getblock", &[raw("12345")]));
@@ -164,6 +222,57 @@ fn getrawtransaction_str_int_allowed() {
 #[test]
 fn getidentity_string_param_allowed() {
     assert!(is_method_allowed("getidentity", &[raw("\"test@\"")]));
+}
+
+#[test]
+fn getidentity_mempool_height_allowed() {
+    for height in ["-1", "0", "123"] {
+        assert!(is_method_allowed(
+            "getidentity",
+            &[raw("\"test@\""), raw(height)]
+        ));
+        assert!(is_method_allowed(
+            "getidentity",
+            &[raw("\"test@\""), raw(height), raw("false"), raw("0")]
+        ));
+    }
+}
+
+#[test]
+fn getidentity_invalid_height_selectors_blocked() {
+    for height in [
+        "-2",
+        "-4294967297",
+        "-1.5",
+        "-1.0",
+        "\"-1\"",
+        "null",
+        "true",
+        "[]",
+        "{}",
+    ] {
+        assert!(
+            !is_method_allowed("getidentity", &[raw("\"test@\""), raw(height)]),
+            "height {height} should be blocked"
+        );
+    }
+}
+
+#[test]
+fn getidentity_mempool_height_does_not_relax_other_arguments() {
+    assert!(!is_method_allowed(
+        "getidentity",
+        &[raw("\"test@\""), raw("-1"), raw("false"), raw("-1")]
+    ));
+    assert!(!is_method_allowed(
+        "getidentity",
+        &[raw("\"test@\""), raw("-1"), raw("0")]
+    ));
+    assert!(!is_method_allowed("getblockhash", &[raw("-1")]));
+    assert!(!is_method_allowed(
+        "getidentitycontent",
+        &[raw("\"test@\""), raw("-1")]
+    ));
 }
 
 #[test]
