@@ -324,6 +324,20 @@ fn validate_get_identity_content(params: &[Value]) -> bool {
             .is_none_or(|value| is_bounded_string(value, MAX_IDENTIFIER_LENGTH))
 }
 
+fn validate_get_tx_out(params: &[Value]) -> bool {
+    if !(2..=3).contains(&params.len()) {
+        return false;
+    }
+
+    // The daemon normalizes noncanonical hashes. Reject aliases before the
+    // exact txid blocklist comparison, and match its signed 32-bit vout parser.
+    is_txid(&params[0])
+        && params[1]
+            .as_u64()
+            .is_some_and(|vout| vout <= i32::MAX as u64)
+        && params.get(2).is_none_or(Value::is_boolean)
+}
+
 fn validate_get_vdxf_id(params: &[Value]) -> bool {
     if params.is_empty() || params.len() > 2 || !is_bounded_string(&params[0], MAX_VDXF_URI_LENGTH)
     {
@@ -687,7 +701,7 @@ pub fn is_method_allowed(method: &str, params: &[Box<RawValue>]) -> bool {
         "getreservedeposits" => check_params(params, &["str"]),
         "getsaplingtree" => check_params(params, &["int"]),
         "getspentinfo" => check_params(params, &["obj"]),
-        "gettxout" => check_params(params, &["str", "int", "bool"]),
+        "gettxout" => validate_get_tx_out(&parsed_params),
         "gettxoutsetinfo" => check_params(params, &[]),
         "getvdxfid" => validate_get_vdxf_id(&parsed_params),
         "hashdata" => check_params(params, &["str", "str", "str"]),

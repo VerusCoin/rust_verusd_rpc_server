@@ -220,6 +220,82 @@ fn getrawtransaction_str_int_allowed() {
 }
 
 #[test]
+fn gettxout_accepts_canonical_txids_and_optional_mempool_flag() {
+    for txid in [TXID.to_owned(), TXID.to_ascii_uppercase()] {
+        for vout in [0, 1, i32::MAX] {
+            for params in [
+                json!([txid, vout]),
+                json!([txid, vout, false]),
+                json!([txid, vout, true]),
+            ] {
+                let raw_params: Vec<_> = params
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .cloned()
+                    .map(raw_json)
+                    .collect();
+                assert!(is_method_allowed("gettxout", &raw_params), "{params}");
+            }
+        }
+    }
+}
+
+#[test]
+fn gettxout_rejects_alternate_txid_spellings() {
+    for txid in [
+        format!("0x{TXID}"),
+        format!("0X{TXID}"),
+        format!(" {TXID}"),
+        format!("\t{TXID}"),
+        format!("{TXID} "),
+        format!("{TXID}suffix"),
+        format!("{TXID}\0"),
+        format!("ff{TXID}"),
+        TXID[1..].to_owned(),
+        String::new(),
+        "g".repeat(64),
+    ] {
+        assert!(
+            !is_method_allowed("gettxout", &[raw_json(json!(txid)), raw("0")]),
+            "txid={txid:?}"
+        );
+    }
+}
+
+#[test]
+fn gettxout_rejects_invalid_arity_types_and_output_indices() {
+    for params in [
+        json!([]),
+        json!([TXID]),
+        json!([TXID, 0, true, false]),
+        json!([null, 0]),
+        json!([123, 0]),
+        json!([TXID, -1]),
+        json!([TXID, i32::MAX as u64 + 1]),
+        json!([TXID, u64::MAX]),
+        json!([TXID, 0.0]),
+        json!([TXID, "0"]),
+        json!([TXID, null]),
+        json!([TXID, true]),
+        json!([TXID, []]),
+        json!([TXID, {}]),
+        json!([TXID, 0, null]),
+        json!([TXID, 0, 1]),
+        json!([TXID, 0, "true"]),
+    ] {
+        let raw_params: Vec<_> = params
+            .as_array()
+            .unwrap()
+            .iter()
+            .cloned()
+            .map(raw_json)
+            .collect();
+        assert!(!is_method_allowed("gettxout", &raw_params), "{params}");
+    }
+}
+
+#[test]
 fn getidentity_string_param_allowed() {
     assert!(is_method_allowed("getidentity", &[raw("\"test@\"")]));
 }

@@ -800,6 +800,111 @@ fn txid_blocklist_is_case_insensitive() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handler_gettxout_rejects_blocked_hash_aliases_and_forwards_valid_params() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend = listener.local_addr().unwrap().to_string();
+    let forwarded = Arc::new(Mutex::new(Vec::new()));
+    let forwarded_in_server = forwarded.clone();
+    tokio::spawn(async move {
+        loop {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let forwarded = forwarded_in_server.clone();
+            tokio::spawn(async move {
+                Http::new()
+                    .http1_keep_alive(false)
+                    .serve_connection(
+                        tcp,
+                        service_fn(move |request: Request<Body>| {
+                            let forwarded = forwarded.clone();
+                            async move {
+                                let bytes =
+                                    hyper::body::to_bytes(request.into_body()).await.unwrap();
+                                let request_json: Value = serde_json::from_slice(&bytes).unwrap();
+                                forwarded.lock().unwrap().push(request_json.clone());
+                                let response = json!({
+                                    "result": {"confirmations": 1},
+                                    "error": null,
+                                    "id": request_json["id"]
+                                });
+                                // SimpleHttpTransport requires a newline-terminated body.
+                                let response_body = format!("{response}\n");
+                                Ok::<_, Infallible>(
+                                    Response::builder()
+                                        .header(hyper::header::CONNECTION, "close")
+                                        .header(hyper::header::CONTENT_LENGTH, response_body.len())
+                                        .body(Body::from(response_body))
+                                        .unwrap(),
+                                )
+                            }
+                        }),
+                    )
+                    .await
+                    .unwrap();
+            });
+        }
+    });
+
+    // A leading zero also exercises the daemon's acceptance of shortened hashes.
+    let blocked_txid = format!("0{}", &BLOCKED_TXID[1..]);
+    let policy = RequestPolicy::new(
+        vec!["gettxout".to_owned()],
+        Vec::new(),
+        vec![blocked_txid.clone()],
+    )
+    .unwrap();
+    let rpc = Arc::new(VerusRPC::new_with_policy(&backend, "user", "pass", policy).unwrap());
+    let rejected = [
+        (blocked_txid.clone(), -32602),
+        (blocked_txid.to_ascii_uppercase(), -32602),
+        (format!("0x{blocked_txid}"), -32601),
+        (format!(" {blocked_txid}"), -32601),
+        (format!("{blocked_txid}suffix"), -32601),
+        (format!("00{blocked_txid}"), -32601),
+        (blocked_txid.trim_start_matches('0').to_owned(), -32601),
+    ];
+    for (txid, expected_code) in rejected {
+        let request = Request::post("/")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"method": "gettxout", "params": [txid, 0, true]}).to_string(),
+            ))
+            .unwrap();
+        let response = handle_req(request, rpc.clone(), None, None).await.unwrap();
+        let body: Value =
+            serde_json::from_slice(&hyper::body::to_bytes(response.into_body()).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], expected_code, "txid={txid}");
+    }
+    assert!(forwarded.lock().unwrap().is_empty());
+
+    let safe_txid = "ab".repeat(32);
+    let valid_params = [
+        json!([safe_txid, 0]),
+        json!([safe_txid, 1, true]),
+        json!([safe_txid.to_ascii_uppercase(), 2, false]),
+    ];
+    for params in &valid_params {
+        let request = Request::post("/")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"method": "gettxout", "params": params}).to_string(),
+            ))
+            .unwrap();
+        let response = handle_req(request, rpc.clone(), None, None).await.unwrap();
+        let body: Value =
+            serde_json::from_slice(&hyper::body::to_bytes(response.into_body()).await.unwrap())
+                .unwrap();
+        assert_eq!(body, json!({"result": {"confirmations": 1}}));
+    }
+    let forwarded = forwarded.lock().unwrap();
+    assert_eq!(forwarded.len(), valid_params.len());
+    for (request, params) in forwarded.iter().zip(valid_params) {
+        assert_eq!(request["method"], "gettxout");
+        assert_eq!(request["params"], params);
+    }
+}
+
 async fn spawn_vdxf_backend(resolved: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
     spawn_vdxf_backend_with_responses(vec![resolved]).await
 }
