@@ -3,7 +3,7 @@ use rust_verusd_rpc_server::auth::AuthState;
 use rust_verusd_rpc_server::usage_log::ApiUsageLog;
 use rust_verusd_rpc_server::{
     configured_api_keys, handle_localhost_req_with_logging, handle_req_with_logging,
-    load_tls_config, BlocklistIdentityCache, RequestLogConfig, RequestPolicy, VerusRPC,
+    load_tls_config, RequestLogConfig, RequestPolicy, VerusRPC,
 };
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -11,11 +11,7 @@ use tokio::net::TcpListener;
 
 #[derive(Clone)]
 struct ServerContext {
-    rpc_url: String,
-    rpc_user: String,
-    rpc_password: String,
-    request_policy: RequestPolicy,
-    blocklist_identity_cache: Arc<BlocklistIdentityCache>,
+    rpc: Arc<VerusRPC>,
     auth: Option<Arc<AuthState>>,
     usage_log: Option<Arc<ApiUsageLog>>,
     request_logging: bool,
@@ -59,7 +55,7 @@ async fn main() {
     let request_policy = RequestPolicy::from_config(&settings, &secrets)
         .unwrap_or_else(|error| panic!("Invalid request policy configuration: {error}"));
     eprintln!(
-        "Request policy loaded ({} whitelisted method(s), {} blocked address(es), {} blocked txid(s), identity-name resolution {}, canonical updateidentity names {}).",
+        "Request policy loaded ({} whitelisted method(s), {} blocked address(es), {} blocked txid(s), identity-name resolution {}, canonical updateidentity names {}, batching {}).",
         request_policy.method_whitelist_len(),
         request_policy.address_blocklist_len(),
         request_policy.txid_blocklist_len(),
@@ -72,6 +68,11 @@ async fn main() {
             "required"
         } else {
             "optional"
+        },
+        if request_policy.batching_enabled() {
+            "enabled"
+        } else {
+            "disabled"
         }
     );
 
@@ -141,11 +142,12 @@ async fn main() {
     };
 
     let context = ServerContext {
-        rpc_url: url,
-        rpc_user: user,
-        rpc_password: password,
-        request_policy,
-        blocklist_identity_cache: Arc::new(BlocklistIdentityCache::new()),
+        // One RPC instance shares admission, transport and identity cache across
+        // all connections and both listeners. A per-connection limit is bypassable.
+        rpc: Arc::new(
+            VerusRPC::new_with_policy(&url, &user, &password, request_policy)
+                .expect("Failed to configure Verus RPC backend URL"),
+        ),
         auth,
         usage_log,
         request_logging,
@@ -202,7 +204,7 @@ async fn serve_http_listener(listener: TcpListener, context: ServerContext, loca
                 if context.request_logging {
                     eprintln!("Accepted TCP connection from {peer_addr}");
                 }
-                let rpc = rpc_for_connection(&context);
+                let rpc = context.rpc.clone();
                 let auth = context.auth.clone();
                 let usage_log = context.usage_log.clone();
                 let request_logging = context.request_logging;
@@ -253,7 +255,7 @@ async fn serve_tls_listener(
                 if context.request_logging {
                     eprintln!("Accepted TCP connection from {peer_addr}");
                 }
-                let rpc = rpc_for_connection(&context);
+                let rpc = context.rpc.clone();
                 let acceptor = acceptor.clone();
                 let auth = context.auth.clone();
                 let usage_log = context.usage_log.clone();
@@ -292,19 +294,6 @@ async fn serve_tls_listener(
             Err(error) => eprintln!("Accept error: {error}"),
         }
     }
-}
-
-fn rpc_for_connection(context: &ServerContext) -> Arc<VerusRPC> {
-    Arc::new(
-        VerusRPC::new_with_policy_and_blocklist_identity_cache(
-            &context.rpc_url,
-            &context.rpc_user,
-            &context.rpc_password,
-            context.request_policy.clone(),
-            context.blocklist_identity_cache.clone(),
-        )
-        .expect("Failed to configure Verus RPC backend URL"),
-    )
 }
 
 fn request_log_config(request_logging: bool, peer_addr: SocketAddr) -> RequestLogConfig {

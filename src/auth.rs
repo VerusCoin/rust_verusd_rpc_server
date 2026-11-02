@@ -14,6 +14,7 @@ pub enum AuthCheckFailure {
         timestamp_ms: i64,
         salt: String,
     },
+    ReplayCacheFull,
     InvalidToken,
 }
 
@@ -25,6 +26,9 @@ pub struct AuthState {
 }
 
 const MAX_CLOCK_SKEW_MS: u64 = 600_000;
+// Slightly above ten minutes at the global 200 logical requests/second rate.
+// Valid signatures rejected by downstream policy also occupy replay entries.
+const MAX_REPLAY_CACHE_ENTRIES: usize = 131_072;
 
 impl AuthState {
     pub fn new(api_keys: HashMap<String, String>) -> Self {
@@ -108,6 +112,16 @@ impl AuthState {
                 salt: salt.to_string(),
             });
         }
+        // Never evict a live entry to admit a new request: doing so would make
+        // an already accepted signature replayable before its window expires.
+        // Reserve an equal share for each configured application. Fresh valid
+        // signatures rejected later by policy/admission still occupy this
+        // cache, so one application must not consume everyone else's share.
+        let app_capacity = (MAX_REPLAY_CACHE_ENTRIES / self.api_keys.len().max(1)).max(1);
+        let app_entries = seen.iter().filter(|(id, _, _)| id == app_id).count();
+        if seen.len() >= MAX_REPLAY_CACHE_ENTRIES || app_entries >= app_capacity {
+            return Err(AuthCheckFailure::ReplayCacheFull);
+        }
         seen.push((app_id.to_string(), time, salt.to_string()));
         Ok(())
     }
@@ -182,4 +196,96 @@ fn compute_token_hash(
     state.update(version.as_bytes());
     state.update(&salt_bytes);
     state.finalize()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_replay_cache_fails_closed_until_expiry_frees_capacity() {
+        let state = AuthState::new(HashMap::from([("app".to_string(), "secret".to_string())]));
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let body = r#"{"method":"getinfo","params":[]}"#;
+        let known_salt = "a".repeat(64);
+        let new_salt = "b".repeat(64);
+        let known_token = compute_token("secret", body, now, "app", "2", &known_salt);
+        let new_token = compute_token("secret", body, now, "app", "2", &new_salt);
+
+        // Populate directly to exercise the boundary without performing over
+        // a hundred thousand token checks. Duplicate fixtures count as entries.
+        *state.seen_requests.lock().unwrap() =
+            vec![("app".to_string(), now, known_salt.clone()); MAX_REPLAY_CACHE_ENTRIES];
+        assert_eq!(
+            state.check_token_detailed(&"0".repeat(128), body, now, "app", "2", &new_salt),
+            Err(AuthCheckFailure::InvalidToken)
+        );
+        assert_eq!(
+            state.check_token_detailed(&new_token, body, now, "app", "2", &new_salt),
+            Err(AuthCheckFailure::ReplayCacheFull)
+        );
+        assert_eq!(
+            state.seen_requests.lock().unwrap().len(),
+            MAX_REPLAY_CACHE_ENTRIES
+        );
+        assert_eq!(
+            state.check_token_detailed(&known_token, body, now, "app", "2", &known_salt),
+            Err(AuthCheckFailure::Replay {
+                timestamp_ms: now,
+                salt: known_salt.clone()
+            })
+        );
+
+        state.seen_requests.lock().unwrap()[0].1 = now - MAX_CLOCK_SKEW_MS as i64 - 1_000;
+        assert_eq!(
+            state.check_token_detailed(&new_token, body, now, "app", "2", &new_salt),
+            Ok(())
+        );
+        assert_eq!(
+            state.seen_requests.lock().unwrap().len(),
+            MAX_REPLAY_CACHE_ENTRIES
+        );
+        assert_eq!(
+            state.check_token_detailed(&new_token, body, now, "app", "2", &new_salt),
+            Err(AuthCheckFailure::Replay {
+                timestamp_ms: now,
+                salt: new_salt
+            })
+        );
+        assert_eq!(
+            state.check_token_detailed(&known_token, body, now, "app", "2", &known_salt),
+            Err(AuthCheckFailure::Replay {
+                timestamp_ms: now,
+                salt: known_salt
+            })
+        );
+    }
+    #[test]
+    fn an_application_cannot_exhaust_another_applications_replay_capacity() {
+        let state = AuthState::new(HashMap::from([
+            ("one".to_owned(), "key".to_owned()),
+            ("two".to_owned(), "key".to_owned()),
+        ]));
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let body = "[]";
+        let salt = "a".repeat(64);
+        *state.seen_requests.lock().unwrap() =
+            vec![("one".to_owned(), now, "b".repeat(64)); MAX_REPLAY_CACHE_ENTRIES / 2];
+        for (app, expected) in [
+            ("one", Err(AuthCheckFailure::ReplayCacheFull)),
+            ("two", Ok(())),
+        ] {
+            let token = compute_token("key", body, now, app, "2", &salt);
+            assert_eq!(
+                state.check_token_detailed(&token, body, now, app, "2", &salt),
+                expected
+            );
+        }
+    }
 }

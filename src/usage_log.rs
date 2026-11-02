@@ -24,6 +24,14 @@ pub struct WindowCounts {
     pub last_30_days: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct RpcItemCounts {
+    attempted: u64,
+    forwarded: u64,
+    rejected: u64,
+    policy_lookups: u64,
+}
+
 pub struct ApiUsageLog {
     path: PathBuf,
     inner: Mutex<ApiUsageLogInner>,
@@ -32,6 +40,7 @@ pub struct ApiUsageLog {
 struct ApiUsageLogInner {
     configured_app_ids: Vec<String>,
     current_run_buckets_by_app: HashMap<String, BTreeMap<i64, u64>>,
+    rpc_items_by_app: HashMap<String, RpcItemCounts>,
     run_started_at_ms: i64,
 }
 
@@ -50,8 +59,10 @@ impl ApiUsageLog {
         configured_app_ids.dedup();
 
         let mut current_run_buckets_by_app = HashMap::new();
+        let mut rpc_items_by_app = HashMap::new();
         for app_id in &configured_app_ids {
             current_run_buckets_by_app.insert(app_id.clone(), BTreeMap::new());
+            rpc_items_by_app.insert(app_id.clone(), RpcItemCounts::default());
         }
 
         let log = ApiUsageLog {
@@ -59,6 +70,7 @@ impl ApiUsageLog {
             inner: Mutex::new(ApiUsageLogInner {
                 configured_app_ids,
                 current_run_buckets_by_app,
+                rpc_items_by_app,
                 run_started_at_ms,
             }),
         };
@@ -72,6 +84,28 @@ impl ApiUsageLog {
 
     pub fn record_call(&self, app_id: &str) -> io::Result<WindowCounts> {
         self.record_call_at(app_id, now_ms())
+    }
+
+    /// Record logical RPC outcomes for a configured application since startup.
+    /// This updates memory only; it neither records another HTTP envelope nor
+    /// writes a snapshot. Internal policy lookups are counted separately from
+    /// the client RPC items. Unconfigured application IDs are ignored.
+    pub fn record_items(
+        &self,
+        app_id: &str,
+        attempted: usize,
+        forwarded: usize,
+        rejected: usize,
+        policy_lookups: usize,
+    ) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(counts) = inner.rpc_items_by_app.get_mut(app_id) else {
+            return;
+        };
+        counts.attempted = counts.attempted.saturating_add(attempted as u64);
+        counts.forwarded = counts.forwarded.saturating_add(forwarded as u64);
+        counts.rejected = counts.rejected.saturating_add(rejected as u64);
+        counts.policy_lookups = counts.policy_lookups.saturating_add(policy_lookups as u64);
     }
 
     pub fn flush_snapshot(&self) -> io::Result<()> {
@@ -119,6 +153,11 @@ impl ApiUsageLogInner {
         let mut apps = serde_json::Map::new();
         for app_id in &self.configured_app_ids {
             let counts = self.snapshot_for(app_id, now_ms);
+            let items = self
+                .rpc_items_by_app
+                .get(app_id)
+                .copied()
+                .unwrap_or_default();
             apps.insert(
                 app_id.clone(),
                 json!({
@@ -127,6 +166,12 @@ impl ApiUsageLogInner {
                         "last_24_hours": counts.last_24_hours,
                         "last_7_days": counts.last_7_days,
                         "last_30_days": counts.last_30_days,
+                    },
+                    "rpc_items": {
+                        "attempted": items.attempted,
+                        "forwarded": items.forwarded,
+                        "rejected": items.rejected,
+                        "policy_lookups": items.policy_lookups,
                     }
                 }),
             );
@@ -230,6 +275,10 @@ mod tests {
         assert_eq!(snapshot["app_ids"], json!(["valu-mobile", "verus-mobile"]));
         assert_eq!(snapshot["apps"]["verus-mobile"]["counts"]["last_hour"], 0);
         assert_eq!(snapshot["apps"]["valu-mobile"]["counts"]["last_30_days"], 0);
+        assert_eq!(
+            snapshot["apps"]["verus-mobile"]["rpc_items"],
+            json!({"attempted": 0, "forwarded": 0, "rejected": 0, "policy_lookups": 0})
+        );
         assert!(snapshot["apps"]["verus-mobile"]
             .get("run_buckets")
             .is_none());
@@ -260,6 +309,67 @@ mod tests {
         assert!(snapshot["apps"]["verus-mobile"]
             .get("run_buckets")
             .is_none());
+    }
+
+    #[test]
+    fn mixed_batch_records_one_envelope_and_flushes_separate_item_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = ApiUsageLog::new(
+            dir.path(),
+            vec!["verus-mobile".to_string(), "valu-mobile".to_string()],
+        )
+        .unwrap();
+        let initial = fs::read_to_string(log.log_path()).unwrap();
+        let base = now_ms();
+
+        log.record_call_at("verus-mobile", base).unwrap();
+        log.record_items("verus-mobile", 3, 2, 1, 1);
+        assert_eq!(fs::read_to_string(log.log_path()).unwrap(), initial);
+
+        log.flush_snapshot_at(base).unwrap();
+        let snapshot = read_json(log.log_path());
+        assert_eq!(snapshot["format"], SNAPSHOT_FORMAT);
+        assert_eq!(
+            snapshot["apps"]["verus-mobile"]["counts"],
+            json!({"last_hour": 1, "last_24_hours": 1, "last_7_days": 1, "last_30_days": 1})
+        );
+        assert_eq!(
+            snapshot["apps"]["verus-mobile"]["rpc_items"],
+            json!({"attempted": 3, "forwarded": 2, "rejected": 1, "policy_lookups": 1})
+        );
+        assert_eq!(
+            snapshot["apps"]["valu-mobile"]["rpc_items"],
+            json!({"attempted": 0, "forwarded": 0, "rejected": 0, "policy_lookups": 0})
+        );
+    }
+
+    #[test]
+    fn item_counts_accumulate_for_the_run_after_envelope_buckets_expire() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = ApiUsageLog::new(dir.path(), vec!["verus-mobile".to_string()]).unwrap();
+        let base = now_ms();
+        log.record_call_at("verus-mobile", base).unwrap();
+        log.record_items("verus-mobile", 3, 2, 1, 1);
+        log.flush_snapshot_at(base).unwrap();
+        let first_snapshot = fs::read_to_string(log.log_path()).unwrap();
+
+        // A later batch rejected at admission still contributes attempted and
+        // rejected items, without any forwarded RPCs or internal lookups.
+        log.record_call_at("verus-mobile", base).unwrap();
+        log.record_items("verus-mobile", 2, 0, 2, 0);
+        assert_eq!(fs::read_to_string(log.log_path()).unwrap(), first_snapshot);
+
+        log.flush_snapshot_at(base + LAST_30_DAYS_MS + BUCKET_MS)
+            .unwrap();
+        let snapshot = read_json(log.log_path());
+        assert_eq!(
+            snapshot["apps"]["verus-mobile"]["counts"]["last_30_days"],
+            0
+        );
+        assert_eq!(
+            snapshot["apps"]["verus-mobile"]["rpc_items"],
+            json!({"attempted": 5, "forwarded": 2, "rejected": 3, "policy_lookups": 1})
+        );
     }
 
     #[test]

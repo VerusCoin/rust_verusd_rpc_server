@@ -275,6 +275,137 @@ async fn http_body_under_limit_no_content_length_accepted() {
 // ── HTTP method, route, and CORS policy ───────────────────────────────────────
 
 #[tokio::test]
+async fn version_endpoint_reports_build_without_auth_or_backend() {
+    for auth in [None, Some(make_auth("test-app", "test-key"))] {
+        let addr = spawn_plain_server(dummy_rpc(), auth).await;
+        let resp = hyper::Client::new()
+            .get(format!("http://{addr}/version").parse().unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()[hyper::header::CONTENT_TYPE],
+            "application/json"
+        );
+        assert_eq!(resp.headers()[hyper::header::CACHE_CONTROL], "no-store");
+        assert!(!resp.headers().contains_key("access-control-allow-origin"));
+        let value: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"version": env!("CARGO_PKG_VERSION")})
+        );
+    }
+}
+
+#[tokio::test]
+async fn version_endpoint_does_not_read_request_body() {
+    let (_sender, body) = Body::channel();
+    let req = Request::get("/version").body(body).unwrap();
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        handle_req(req, dummy_rpc(), Some(make_auth("app", "key")), None),
+    )
+    .await
+    .expect("version metadata must not wait for an RPC body")
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn version_endpoint_requires_get_and_exact_path() {
+    let rpc = dummy_rpc();
+    for method in [
+        hyper::Method::POST,
+        hyper::Method::HEAD,
+        hyper::Method::OPTIONS,
+    ] {
+        let req = Request::builder()
+            .method(method)
+            .uri("/version")
+            .body(Body::empty())
+            .unwrap();
+        let resp = handle_req(req, rpc.clone(), None, None).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(resp.headers()[hyper::header::ALLOW], "GET");
+    }
+    for path in ["/version/", "/version?query=not-allowed", "/versions"] {
+        let req = Request::get(path).body(Body::empty()).unwrap();
+        let resp = handle_req(req, rpc.clone(), None, None).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(resp.headers()[hyper::header::ALLOW], "POST");
+    }
+}
+
+#[tokio::test]
+async fn localhost_version_endpoint_preserves_origin_policy() {
+    for (origin, status) in [
+        ("http://localhost:3000", StatusCode::OK),
+        ("https://example.com", StatusCode::FORBIDDEN),
+    ] {
+        let req = Request::get("/version")
+            .header(hyper::header::ORIGIN, origin)
+            .body(Body::empty())
+            .unwrap();
+        let resp = handle_localhost_req_with_logging(
+            req,
+            dummy_rpc(),
+            Some(make_auth("app", "key")),
+            None,
+            RequestLogConfig::disabled(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), status);
+        if status == StatusCode::OK {
+            assert_eq!(
+                resp.headers()[hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN],
+                origin
+            );
+            assert_eq!(resp.headers()[hyper::header::VARY], "Origin");
+        } else {
+            assert!(!resp
+                .headers()
+                .contains_key(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN));
+        }
+    }
+}
+
+#[tokio::test]
+async fn localhost_version_preflight_only_allows_get() {
+    for (method, status) in [
+        ("GET", StatusCode::NO_CONTENT),
+        ("POST", StatusCode::FORBIDDEN),
+    ] {
+        let req = Request::options("/version")
+            .header(hyper::header::ORIGIN, "http://localhost:3000")
+            .header(hyper::header::ACCESS_CONTROL_REQUEST_METHOD, method)
+            .body(Body::empty())
+            .unwrap();
+        let resp = handle_localhost_req_with_logging(
+            req,
+            dummy_rpc(),
+            None,
+            None,
+            RequestLogConfig::disabled(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), status);
+        if status == StatusCode::NO_CONTENT {
+            assert_eq!(
+                resp.headers()[hyper::header::ACCESS_CONTROL_ALLOW_METHODS],
+                "GET"
+            );
+        } else {
+            assert!(!resp
+                .headers()
+                .contains_key(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN));
+        }
+    }
+}
+
+#[tokio::test]
 async fn options_is_rejected_without_cors_headers() {
     let addr = spawn_plain_server(dummy_rpc(), None).await;
     let resp = hyper::Client::new()
@@ -653,10 +784,10 @@ async fn signdata_without_address_passes_allowlist() {
 
 // ── HIGH-4: shared VerusRPC — concurrent-request behavioral test ──────────────
 
-/// 20 concurrent requests must all complete. This surfaces connection exhaustion
-/// or accidental request serialization in the shared VerusRPC path.
+/// Every concurrent request completes or is explicitly rejected by admission;
+/// overload never becomes a connection failure or an unbounded work queue.
 #[tokio::test]
-async fn concurrent_requests_all_complete_successfully() {
+async fn concurrent_requests_complete_or_report_overload() {
     let addr = spawn_plain_server(dummy_rpc(), None).await;
     let handles: Vec<_> = (0..20)
         .map(|_| {
@@ -666,10 +797,21 @@ async fn concurrent_requests_all_complete_successfully() {
         })
         .collect();
 
+    let mut admitted = 0;
     for h in handles {
         let resp = h.await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        match resp.status() {
+            StatusCode::OK => admitted += 1,
+            StatusCode::TOO_MANY_REQUESTS => {
+                assert_eq!(resp.headers()[hyper::header::RETRY_AFTER], "1");
+                let body: serde_json::Value =
+                    serde_json::from_str(&body_string(resp).await).unwrap();
+                assert_eq!(body["error"]["code"], -32000);
+            }
+            status => panic!("unexpected concurrent request status: {status}"),
+        }
     }
+    assert!(admitted > 0);
 }
 
 // ── MED-5: TLS config loading ─────────────────────────────────────────────────

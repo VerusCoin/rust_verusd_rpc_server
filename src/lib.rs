@@ -4,28 +4,37 @@ use hyper::header::{
     ORIGIN, VARY,
 };
 use hyper::{Body, Method, Request, Response, StatusCode, Uri};
-use jsonrpc::simple_http::{self, SimpleHttpTransport};
 use jsonrpc::{error::RpcError, Client};
 use serde_json::value::RawValue;
 use serde_json::{json, Value};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::time::{timeout, Duration};
 
+mod admission;
 pub mod allowlist;
 pub mod auth;
+mod backend;
 mod identity;
 pub mod usage_log;
+use admission::{Admission, BodyPermit, WorkPermit};
 use auth::AuthState;
+use backend::Backend;
+pub use backend::BackendError;
 use identity::{derive_parented_identity_address, is_canonical_identity_leaf_name};
 use usage_log::ApiUsageLog;
 
 const READ_TIMEOUT_SECS: Duration = Duration::from_secs(5);
 const MAX_BLOCKLIST_IDENTITY_CACHE_ENTRIES: usize = 4_096;
 const JSON_RPC_PATH: &str = "/";
+const VERSION_PATH: &str = "/version";
+/// Deployment SemVer compiled into this server binary from Cargo.toml.
+pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const LOCALHOST_CORS_ALLOW_HEADERS: &str =
     "Content-Type, Accept, X-App-ID, X-Timestamp, X-Auth-Token, X-VRPC-API-Version, X-Salt";
 const LOCALHOST_CORS_ALLOWED_HEADER_NAMES: &[&str] = &[
@@ -38,17 +47,35 @@ const LOCALHOST_CORS_ALLOWED_HEADER_NAMES: &[&str] = &[
     "x-salt",
 ];
 static NEXT_REQUEST_LOG_ID: AtomicU64 = AtomicU64::new(1);
-// 1 MiB — sufficient for any JSON-RPC payload on this API surface.
+// Limits apply to the entire envelope, including batches.
 // Enforced on actual accumulated bytes, not the Content-Length header.
 pub const MAX_BODY_BYTES: usize = 2048 * 1024;
+pub const MAX_BATCH_REQUESTS: usize = 20;
+pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const EXECUTION_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_POLICY_LOOKUPS: usize = 40;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct RequestPolicy {
     method_whitelist: HashSet<String>,
     address_blocklist: HashSet<String>,
     txid_blocklist: HashSet<String>,
     resolve_identity_names_for_blocklist: bool,
     require_canonical_identity_leaf_names: bool,
+    batching_enabled: bool,
+}
+
+impl Default for RequestPolicy {
+    fn default() -> Self {
+        Self {
+            method_whitelist: HashSet::new(),
+            address_blocklist: HashSet::new(),
+            txid_blocklist: HashSet::new(),
+            resolve_identity_names_for_blocklist: false,
+            require_canonical_identity_leaf_names: false,
+            batching_enabled: true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -228,8 +255,7 @@ impl RequestPolicy {
             method_whitelist,
             address_blocklist,
             txid_blocklist,
-            resolve_identity_names_for_blocklist: false,
-            require_canonical_identity_leaf_names: false,
+            ..Self::default()
         })
     }
 
@@ -237,6 +263,13 @@ impl RequestPolicy {
         settings: &config::Config,
         secrets: &config::Config,
     ) -> Result<Self, String> {
+        // Inspect the JSON value so config cannot coerce strings or numbers
+        // into a boolean for this feature switch.
+        let batching_enabled = match settings.get::<Value>("batching_enabled") {
+            Ok(Value::Bool(enabled)) => enabled,
+            Err(config::ConfigError::NotFound(_)) => true,
+            _ => return Err("'batching_enabled' must be a boolean".to_owned()),
+        };
         let resolve_identity_names =
             optional_bool(settings, "resolve_identity_names_for_blocklist", false)?;
         let require_canonical_names =
@@ -246,8 +279,19 @@ impl RequestPolicy {
             optional_string_list(secrets, "address_blocklist")?,
             optional_string_list(secrets, "txid_blocklist")?,
         )?
+        .with_batching_enabled(batching_enabled)
         .with_identity_name_resolution_for_blocklist(resolve_identity_names)
         .with_canonical_identity_leaf_names_required(require_canonical_names))
+    }
+
+    /// Controls top-level command arrays; single-command requests remain enabled.
+    pub fn with_batching_enabled(mut self, enabled: bool) -> Self {
+        self.batching_enabled = enabled;
+        self
+    }
+
+    pub fn batching_enabled(&self) -> bool {
+        self.batching_enabled
     }
 
     pub fn with_identity_name_resolution_for_blocklist(mut self, enabled: bool) -> Self {
@@ -609,6 +653,7 @@ impl RequestLogConfig {
     }
 }
 
+#[derive(Clone)]
 struct RequestTrace {
     config: RequestLogConfig,
     id: u64,
@@ -662,13 +707,28 @@ macro_rules! request_log {
 }
 
 pub struct VerusRPC {
-    client: Arc<Mutex<Client>>,
+    backend: Backend,
+    admission: Arc<Admission>,
     request_policy: RequestPolicy,
     blocklist_identity_cache: Arc<BlocklistIdentityCache>,
 }
 
+// Only reconstructed, validated calls reach either backend dispatch path.
+// In particular, never validate parsed values and then forward the original JSON.
+struct PreparedRequest {
+    method: String,
+    params: Vec<Box<RawValue>>,
+}
+
+struct Execution<'a> {
+    client: Client,
+    deadline: Instant,
+    permit: &'a WorkPermit,
+    lookups: Cell<usize>,
+}
+
 impl VerusRPC {
-    pub fn new(url: &str, user: &str, pass: &str) -> Result<VerusRPC, simple_http::Error> {
+    pub fn new(url: &str, user: &str, pass: &str) -> Result<VerusRPC, BackendError> {
         Self::new_with_policy(url, user, pass, RequestPolicy::default())
     }
 
@@ -677,7 +737,7 @@ impl VerusRPC {
         user: &str,
         pass: &str,
         request_policy: RequestPolicy,
-    ) -> Result<VerusRPC, simple_http::Error> {
+    ) -> Result<VerusRPC, BackendError> {
         Self::new_with_policy_and_blocklist_identity_cache(
             url,
             user,
@@ -693,22 +753,24 @@ impl VerusRPC {
         pass: &str,
         request_policy: RequestPolicy,
         blocklist_identity_cache: Arc<BlocklistIdentityCache>,
-    ) -> Result<VerusRPC, simple_http::Error> {
-        let transport = SimpleHttpTransport::builder()
-            .url(url)?
-            .auth(user, Some(pass))
-            .build();
+    ) -> Result<VerusRPC, BackendError> {
         Ok(VerusRPC {
-            client: Arc::new(Mutex::new(Client::with_transport(transport))),
+            backend: Backend::new(url, user, pass)?,
+            admission: Arc::new(Admission::new()),
             request_policy,
             blocklist_identity_cache,
         })
     }
 
-    fn handle(&self, req_body: Value, trace: &RequestTrace) -> Result<Value, RpcError> {
+    fn prepare(
+        &self,
+        req_body: Value,
+        trace: &RequestTrace,
+        execution: &Execution<'_>,
+    ) -> Result<PreparedRequest, RpcError> {
         let method = match req_body["method"].as_str() {
             Some(method) => {
-                request_log!(trace, "JSON-RPC method extracted: {method}");
+                trace.log("JSON-RPC method field accepted");
                 method
             }
             None => {
@@ -724,9 +786,8 @@ impl VerusRPC {
             Some(params) => {
                 request_log!(
                     trace,
-                    "JSON-RPC params accepted as array: count={}, params={}",
-                    params.len(),
-                    Value::Array(params.clone())
+                    "JSON-RPC params accepted as array: count={}",
+                    params.len()
                 );
                 params
                     .iter()
@@ -761,7 +822,7 @@ impl VerusRPC {
         if !allowlist::is_method_allowed(method, &params) {
             request_log!(
                 trace,
-                "allowlist rejected method={method}, params_count={}",
+                "allowlist rejected request, params_count={}",
                 params.len()
             );
             return Err(RpcError {
@@ -792,7 +853,7 @@ impl VerusRPC {
             .expect("params were validated as an array above");
         self.request_policy
             .check_blocklists(method, params_json, |identity_name| {
-                self.resolve_identity_address(identity_name, trace)
+                self.resolve_identity_address(identity_name, trace, execution)
                     .map_err(|_| ())
             })
             .map_err(|reason| {
@@ -807,75 +868,136 @@ impl VerusRPC {
                 }
             })?;
 
-        let client = self.client.lock().unwrap_or_else(|e| e.into_inner());
-        let request = client.build_request(method, &params);
+        Ok(PreparedRequest {
+            method: method.to_owned(),
+            params,
+        })
+    }
 
-        let send_started_at = Instant::now();
+    fn execute(
+        &self,
+        body: Value,
+        trace: &RequestTrace,
+        permit: &WorkPermit,
+        deadline: Instant,
+    ) -> (Value, OperationCounts) {
+        let is_batch = body.is_array();
+        let items = match body {
+            Value::Array(items) => items,
+            single => vec![single],
+        };
+        let execution = Execution {
+            client: self.backend.client(deadline),
+            deadline,
+            permit,
+            lookups: Cell::new(0),
+        };
+        let mut counts = OperationCounts {
+            attempted: items.len(),
+            ..OperationCounts::default()
+        };
+        let mut replies = vec![Value::Null; items.len()];
+        let mut prepared = Vec::with_capacity(items.len());
+
+        // Preflight all members before submitting any client command. Internal
+        // policy lookups share the same deadline, byte budget and rate limits.
+        for (index, item) in items.into_iter().enumerate() {
+            let result = if is_batch && !item.is_object() {
+                Err(rpc_error(-32600, "Invalid batch item"))
+            } else if Instant::now() >= deadline {
+                Err(rpc_error(
+                    -32603,
+                    "Execution deadline exceeded before dispatch",
+                ))
+            } else {
+                self.prepare(item, trace, &execution)
+            };
+            match result {
+                Ok(request) => prepared.push((index, request)),
+                Err(error) => {
+                    request_log!(trace, "item={index} rejected: code={}", error.code);
+                    counts.rejected += 1;
+                    replies[index] = rpc_reply(Err(error));
+                }
+            }
+        }
+
+        counts.lookups = execution.lookups.get();
+        counts.forwarded = prepared.len();
+        if !prepared.is_empty() {
+            if is_batch {
+                let requests: Vec<_> = prepared
+                    .iter()
+                    .map(|(_, request)| {
+                        execution
+                            .client
+                            .build_request(&request.method, &request.params)
+                    })
+                    .collect();
+                // Unique internal IDs restore input order even if a backend
+                // changes response order. Never retry an uncertain dispatch.
+                match execution.client.send_batch(&requests) {
+                    Ok(responses) => {
+                        for ((index, _), response) in prepared.iter().zip(responses) {
+                            replies[*index] = rpc_reply(match response {
+                                Some(response) => backend_result(response),
+                                None => Err(unknown_backend_outcome()),
+                            });
+                        }
+                    }
+                    Err(_) => {
+                        for (index, _) in &prepared {
+                            replies[*index] = rpc_reply(Err(unknown_backend_outcome()));
+                        }
+                    }
+                }
+            } else {
+                let request = &prepared[0].1;
+                // Client::call checks the response ID and protocol version.
+                replies[0] = rpc_reply(
+                    execution
+                        .client
+                        .call(&request.method, &request.params)
+                        .map_err(map_backend_error),
+                );
+            }
+        }
         request_log!(
             trace,
-            "sending request to Verus RPC backend: method={method}"
+            "RPC items: attempted={}, forwarded={}, rejected={}, policy_lookups={}",
+            counts.attempted,
+            counts.forwarded,
+            counts.rejected,
+            counts.lookups
         );
-        let response = client.send_request(request).map_err(|e| {
+        for (index, reply) in replies.iter().enumerate() {
             request_log!(
                 trace,
-                "Verus RPC backend send_request failed after {}ms: {:?}",
-                send_started_at.elapsed().as_millis(),
-                e
+                "item={index} completed: success={}",
+                reply.get("result").is_some()
             );
-            match e {
-                jsonrpc::Error::Rpc(rpc_error) => rpc_error,
-                _ => RpcError {
-                    code: -32603,
-                    message: "Internal error".into(),
-                    data: None,
-                },
-            }
-        })?;
-        request_log!(
-            trace,
-            "Verus RPC backend send_request completed after {}ms",
-            send_started_at.elapsed().as_millis()
-        );
-
-        let result_started_at = Instant::now();
-        let result: Value = response.result().map_err(|e| {
-            request_log!(
-                trace,
-                "Verus RPC backend response.result failed after {}ms: {:?}",
-                result_started_at.elapsed().as_millis(),
-                e
-            );
-            match e {
-                jsonrpc::Error::Rpc(rpc_error) => rpc_error,
-                _ => RpcError {
-                    code: -32603,
-                    message: "Internal error".into(),
-                    data: None,
-                },
-            }
-        })?;
-        request_log!(
-            trace,
-            "Verus RPC backend returned result after {}ms: {}",
-            result_started_at.elapsed().as_millis(),
-            result
-        );
-        Ok(result)
+        }
+        (
+            if is_batch {
+                Value::Array(replies)
+            } else {
+                replies.remove(0)
+            },
+            counts,
+        )
     }
 
     fn resolve_identity_address(
         &self,
         identity_name: &str,
         trace: &RequestTrace,
+        execution: &Execution<'_>,
     ) -> Result<String, RpcError> {
         let (address, cache_hit) = self.blocklist_identity_cache.resolve(identity_name, || {
-            self.resolve_identity_address_uncached(identity_name, trace)
+            self.resolve_identity_address_uncached(identity_name, trace, execution)
         })?;
         if cache_hit {
-            request_log!(
-                trace,
-                "blocklist identity resolution cache hit for selector={identity_name:?}"
-            );
+            request_log!(trace, "blocklist identity resolution cache hit");
         }
         Ok(address)
     }
@@ -884,28 +1006,32 @@ impl VerusRPC {
         &self,
         identity_name: &str,
         trace: &RequestTrace,
+        execution: &Execution<'_>,
     ) -> Result<String, RpcError> {
+        if execution.lookups.get() >= MAX_POLICY_LOOKUPS
+            || Instant::now() >= execution.deadline
+            || execution.permit.try_charge_lookup().is_err()
+        {
+            return Err(rpc_error(-32603, "Policy lookup budget exhausted"));
+        }
+        execution.lookups.set(execution.lookups.get() + 1);
         let param = RawValue::from_string(
             serde_json::to_string(identity_name).expect("serializing a string cannot fail"),
         )
         .expect("serialized JSON string must be valid raw JSON");
         let params = vec![param];
-        let client = self.client.lock().unwrap_or_else(|e| e.into_inner());
-        let request = client.build_request("getvdxfid", &params);
         request_log!(
             trace,
             "resolving human-readable identity for request blocklist"
         );
-        let response = client.send_request(request).map_err(|_| RpcError {
-            code: -32603,
-            message: "Internal error".into(),
-            data: None,
-        })?;
-        let result: Value = response.result().map_err(|_| RpcError {
-            code: -32603,
-            message: "Internal error".into(),
-            data: None,
-        })?;
+        let result: Value = execution
+            .client
+            .call("getvdxfid", &params)
+            .map_err(|_| RpcError {
+                code: -32603,
+                message: "Internal error".into(),
+                data: None,
+            })?;
         let address = result
             .get("vdxfid")
             .and_then(Value::as_str)
@@ -924,6 +1050,194 @@ impl VerusRPC {
         }
         Ok(address)
     }
+}
+
+#[derive(Default)]
+struct OperationCounts {
+    attempted: usize,
+    forwarded: usize,
+    rejected: usize,
+    lookups: usize,
+}
+
+fn rpc_error(code: i32, message: &str) -> RpcError {
+    RpcError {
+        code,
+        message: message.to_owned(),
+        data: None,
+    }
+}
+
+fn unknown_backend_outcome() -> RpcError {
+    rpc_error(
+        -32603,
+        "Backend response unavailable; execution outcome unknown",
+    )
+}
+
+fn map_backend_error(error: jsonrpc::Error) -> RpcError {
+    match error {
+        jsonrpc::Error::Rpc(error) => error,
+        _ => unknown_backend_outcome(),
+    }
+}
+
+fn backend_result(response: jsonrpc::Response) -> Result<Value, RpcError> {
+    response.result().map_err(map_backend_error)
+}
+
+fn rpc_reply(result: Result<Value, RpcError>) -> Value {
+    match result {
+        Ok(result) => json!({"result": result}),
+        Err(error) => json!({"error": {"code": error.code, "message": error.message}}),
+    }
+}
+
+// Cap the final encoding too: parsed JSON and local errors can have a different
+// serialized size than the bounded upstream body. Never allocate it unbounded.
+struct ResponseBuffer(Vec<u8>);
+
+impl Write for ResponseBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > MAX_RESPONSE_BYTES.saturating_sub(self.0.len()) {
+            return Err(std::io::Error::other("response size limit exceeded"));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encode_reply(reply: Value) -> Vec<u8> {
+    let mut buffer = ResponseBuffer(Vec::new());
+    if serde_json::to_writer(&mut buffer, &reply).is_ok() {
+        return buffer.0;
+    }
+    // Preserve small known errors (especially local policy rejections). Only
+    // unavailable/oversized results lose their outcome, never their position.
+    let compact = |reply: Value| {
+        if reply["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.len() <= 1024)
+        {
+            reply
+        } else {
+            rpc_reply(Err(unknown_backend_outcome()))
+        }
+    };
+    let fallback = match reply {
+        Value::Array(items) => Value::Array(items.into_iter().map(compact).collect()),
+        single => compact(single),
+    };
+    serde_json::to_vec(&fallback).expect("small error response is serializable")
+}
+
+fn parse_request_body(body: &str) -> Result<Value, RpcError> {
+    // Stop building the top-level array at the limit. A small byte payload can
+    // otherwise allocate a very large Value array before the count check runs.
+    struct Batch(Vec<Value>);
+    impl<'de> serde::Deserialize<'de> for Batch {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct Visitor;
+            impl<'de> serde::de::Visitor<'de> for Visitor {
+                type Value = Batch;
+
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("a nonempty bounded array of requests")
+                }
+
+                fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                    self,
+                    mut seq: A,
+                ) -> Result<Batch, A::Error> {
+                    let mut items = Vec::new();
+                    while let Some(item) = seq.next_element()? {
+                        if items.len() == MAX_BATCH_REQUESTS {
+                            return Err(serde::de::Error::custom("batch too large"));
+                        }
+                        items.push(item);
+                    }
+                    if items.is_empty() {
+                        return Err(serde::de::Error::custom("empty batch"));
+                    }
+                    Ok(Batch(items))
+                }
+            }
+            deserializer.deserialize_seq(Visitor)
+        }
+    }
+
+    if body.trim_start().starts_with('[') {
+        serde_json::from_str::<Batch>(body)
+            .map(|batch| Value::Array(batch.0))
+            .map_err(|error| {
+                if error.is_data() {
+                    rpc_error(-32600, "Batch must contain 1 to 20 requests")
+                } else {
+                    rpc_error(-32700, "Parse error")
+                }
+            })
+    } else {
+        serde_json::from_str(body).map_err(|_| rpc_error(-32700, "Parse error"))
+    }
+}
+
+#[cfg(test)]
+mod envelope_tests {
+    use super::*;
+
+    #[test]
+    fn response_overflow_preserves_local_rejections_and_array_positions() {
+        let rejected = rpc_reply(Err(rpc_error(-32601, "Method not found")));
+        let reply = Value::Array(vec![
+            rejected.clone(),
+            json!({"result": "x".repeat(MAX_RESPONSE_BYTES)}),
+        ]);
+        let encoded = encode_reply(reply);
+        assert!(encoded.len() < MAX_RESPONSE_BYTES);
+        let decoded: Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.as_array().unwrap().len(), 2);
+        assert_eq!(decoded[0], rejected);
+        assert_eq!(decoded[1]["error"]["code"], -32603);
+        assert!(decoded[1].get("result").is_none());
+    }
+
+    #[test]
+    fn batch_count_limit_stops_before_parsing_the_remaining_payload() {
+        // Once the limit is exceeded, reject without materializing subsequent
+        // values, even if the remaining payload is incomplete.
+        let body = format!("[{}{{}},", "{},".repeat(MAX_BATCH_REQUESTS));
+        assert_eq!(parse_request_body(&body).unwrap_err().code, -32600);
+        assert_eq!(parse_request_body("[]").unwrap_err().code, -32600);
+        assert_eq!(parse_request_body("[{]").unwrap_err().code, -32700);
+    }
+}
+
+// Keep admission capacity until the response bytes are consumed or dropped,
+// including when a slow reader retains a large response after execution ends.
+struct AdmittedResponse {
+    bytes: Vec<u8>,
+    _permit: Option<BodyPermit>,
+}
+
+impl AsRef<[u8]> for AdmittedResponse {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+fn overloaded_response() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .header(hyper::header::RETRY_AFTER, "1")
+        .body(Body::from(
+            rpc_reply(Err(rpc_error(-32000, "Server busy; request not executed"))).to_string(),
+        ))
+        .expect("static overload response is valid")
 }
 
 #[derive(Debug)]
@@ -959,8 +1273,8 @@ pub async fn handle_req(
 /// The listener itself is responsible for enforcing a loopback peer address.
 /// This wrapper adds narrowly scoped browser support: only exact HTTP(S)
 /// origins hosted on localhost, 127.0.0.1, or ::1 receive CORS permission.
-/// Authentication and all normal request policy checks are still performed by
-/// `handle_req_with_logging`.
+/// RPC authentication and policy checks, and the public deployment-version
+/// endpoint, are handled by `handle_req_with_logging`.
 pub async fn handle_localhost_req_with_logging(
     req: Request<Body>,
     rpc: Arc<VerusRPC>,
@@ -979,13 +1293,18 @@ pub async fn handle_localhost_req_with_logging(
     };
 
     if req.method() == Method::OPTIONS {
-        let valid_route =
-            req.uri().path_and_query().map(|value| value.as_str()) == Some(JSON_RPC_PATH);
-        let requested_method_is_post = req
+        let allowed_method = match req.uri().path_and_query().map(|value| value.as_str()) {
+            Some(JSON_RPC_PATH) => Some("POST"),
+            Some(VERSION_PATH) => Some("GET"),
+            _ => None,
+        };
+        let requested_method_is_allowed = req
             .headers()
             .get(ACCESS_CONTROL_REQUEST_METHOD)
             .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.eq_ignore_ascii_case("POST"));
+            .is_some_and(|value| {
+                allowed_method.is_some_and(|allowed| value.eq_ignore_ascii_case(allowed))
+            });
         let requested_headers_are_allowed = req
             .headers()
             .get(ACCESS_CONTROL_REQUEST_HEADERS)
@@ -994,7 +1313,7 @@ pub async fn handle_localhost_req_with_logging(
         let Some(origin) = origin else {
             return handle_req_with_logging(req, rpc, auth, usage_log, log_config).await;
         };
-        if !valid_route || !requested_method_is_post || !requested_headers_are_allowed {
+        if !requested_method_is_allowed || !requested_headers_are_allowed {
             return Ok(Response::builder()
                 .status(StatusCode::FORBIDDEN)
                 .body(Body::from("CORS preflight not allowed"))
@@ -1005,13 +1324,13 @@ pub async fn handle_localhost_req_with_logging(
             .status(StatusCode::NO_CONTENT)
             .body(Body::empty())
             .expect("static localhost CORS response must be valid");
-        add_localhost_cors_headers(&mut response, origin, true);
+        add_localhost_cors_headers(&mut response, origin, allowed_method);
         return Ok(response);
     }
 
     let mut response = handle_req_with_logging(req, rpc, auth, usage_log, log_config).await?;
     if let Some(origin) = origin {
-        add_localhost_cors_headers(&mut response, origin, false);
+        add_localhost_cors_headers(&mut response, origin, None);
     }
     Ok(response)
 }
@@ -1068,14 +1387,18 @@ fn cors_requested_headers_are_allowed(value: &HeaderValue) -> bool {
     })
 }
 
-fn add_localhost_cors_headers(response: &mut Response<Body>, origin: HeaderValue, preflight: bool) {
+fn add_localhost_cors_headers(
+    response: &mut Response<Body>,
+    origin: HeaderValue,
+    preflight_method: Option<&'static str>,
+) {
     let headers = response.headers_mut();
     headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin);
     headers.insert(VARY, HeaderValue::from_static("Origin"));
-    if preflight {
+    if let Some(method) = preflight_method {
         headers.insert(
             ACCESS_CONTROL_ALLOW_METHODS,
-            HeaderValue::from_static("POST"),
+            HeaderValue::from_static(method),
         );
         headers.insert(
             ACCESS_CONTROL_ALLOW_HEADERS,
@@ -1105,6 +1428,28 @@ pub async fn handle_req_with_logging(
         headers_for_log(&parts.headers)
     );
 
+    // Deployment metadata is public and independent of RPC authentication,
+    // admission, request-body ingestion, and daemon availability.
+    if parts.uri.path_and_query().map(|value| value.as_str()) == Some(VERSION_PATH) {
+        if parts.method != Method::GET {
+            let body_text = "Method not allowed";
+            let response = Response::builder()
+                .status(StatusCode::METHOD_NOT_ALLOWED)
+                .header(hyper::header::ALLOW, "GET")
+                .body(Body::from(body_text))
+                .expect("static version method response must be valid");
+            return log_and_return_response(&trace, response, body_text);
+        }
+        let body_text = json!({ "version": SERVER_VERSION }).to_string();
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .header(hyper::header::CACHE_CONTROL, "no-store")
+            .body(Body::from(body_text.clone()))
+            .expect("static version response must be valid");
+        return log_and_return_response(&trace, response, &body_text);
+    }
+
     if parts.method != hyper::Method::POST {
         trace.log("request rejected: only POST is allowed");
         let body_text = "Method not allowed";
@@ -1125,6 +1470,13 @@ pub async fn handle_req_with_logging(
             .unwrap();
         return log_and_return_response(&trace, response, body_text);
     }
+
+    // No queue of buffered request bodies: capacity is shared by all users of
+    // this VerusRPC, including both production listeners.
+    let body_permit = match rpc.admission.try_acquire_body() {
+        Ok(permit) => permit,
+        Err(_) => return Ok(overloaded_response()),
+    };
 
     // CRIT-1 fix: size is enforced during accumulation inside read_body_limited,
     // so a missing or lying Content-Length header cannot bypass the limit.
@@ -1173,12 +1525,7 @@ pub async fn handle_req_with_logging(
 
     let str_body = match String::from_utf8(whole_body) {
         Ok(s) => {
-            request_log!(
-                trace,
-                "request body decoded as UTF-8: chars={}, body={}",
-                s.chars().count(),
-                s
-            );
+            request_log!(trace, "request body decoded as UTF-8: bytes={}", s.len());
             s
         }
         Err(_e) => {
@@ -1194,6 +1541,7 @@ pub async fn handle_req_with_logging(
 
     // Auth gate: version check then token check, both before JSON parsing.
     // The full raw body is hashed so any parameter tampering invalidates the token.
+    let mut authenticated_app = None;
     if let Some(auth_state) = &auth {
         trace.log("API key auth enabled for request");
         let version = parts
@@ -1201,7 +1549,7 @@ pub async fn handle_req_with_logging(
             .get("x-vrpc-api-version")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        request_log!(trace, "auth header x-vrpc-api-version={version:?}");
+        trace.log("checking API auth version");
         if version != "2" {
             trace.log("auth rejected: X-VRPC-API-Version must be 2");
             let body_text =
@@ -1218,11 +1566,7 @@ pub async fn handle_req_with_logging(
             .get("x-salt")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        request_log!(
-            trace,
-            "auth header x-salt length={}, value={salt:?}",
-            salt.len()
-        );
+        request_log!(trace, "auth header x-salt length={}", salt.len());
         if salt.len() != 64 || !salt.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
             trace.log("auth rejected: X-Salt malformed");
             let body_text = json!({"error": {"code": -32600, "message": "X-Salt must be exactly 64 lowercase hex characters (32 bytes)"}}).to_string();
@@ -1250,12 +1594,16 @@ pub async fn handle_req_with_logging(
             .unwrap_or("");
         request_log!(
             trace,
-            "auth headers parsed: app_id={app_id:?}, timestamp_ms={timestamp}, token_chars={}",
+            "auth headers parsed: timestamp_ms={timestamp}, token_chars={}",
             token.len()
         );
 
         match auth_state.check_token_detailed(token, &str_body, timestamp, app_id, version, salt) {
             Ok(()) => trace.log("auth accepted"),
+            Err(auth::AuthCheckFailure::ReplayCacheFull) => {
+                trace.log("authentication replay cache capacity reached");
+                return Ok(overloaded_response());
+            }
             Err(reason) => {
                 request_log!(trace, "auth rejected: {:?}", reason);
                 let body_text =
@@ -1267,6 +1615,7 @@ pub async fn handle_req_with_logging(
                 return log_and_return_response(&trace, response, &body_text);
             }
         }
+        authenticated_app = Some(app_id.to_owned());
 
         if let Some(usage_log) = &usage_log {
             match usage_log.record_call(app_id) {
@@ -1291,49 +1640,88 @@ pub async fn handle_req_with_logging(
         trace.log("API key auth disabled for request");
     }
 
-    let json_body: Result<Value, _> = serde_json::from_str(&str_body);
-    let result = match json_body {
-        Ok(req_body) => {
-            request_log!(trace, "JSON parse accepted body: {}", req_body);
-            rpc.handle(req_body, &trace)
+    let parsed = parse_request_body(&str_body).and_then(|body| {
+        // Reject the whole batch before work admission or policy lookups.
+        // Authentication above applies whether or not batching is enabled.
+        if body.is_array() && !rpc.request_policy.batching_enabled() {
+            Err(rpc_error(-32600, "Batching is disabled"))
+        } else {
+            Ok(body)
         }
-        Err(err) => {
-            request_log!(trace, "JSON parse failed: {err}");
-            Err(RpcError {
-                code: -32700,
-                message: "Parse error".into(),
-                data: None,
+    });
+    drop(str_body);
+
+    let output = match parsed {
+        Err(error) => AdmittedResponse {
+            bytes: encode_reply(rpc_reply(Err(error))),
+            _permit: Some(body_permit),
+        },
+        Ok(body) => {
+            let is_batch = body.is_array();
+            let count = body.as_array().map_or(1, Vec::len);
+            let permit = match rpc.admission.try_enter(authenticated_app.as_deref(), count) {
+                Ok(permit) => permit,
+                Err(reason) => {
+                    request_log!(trace, "work admission rejected: {reason:?}, items={count}");
+                    if let (Some(log), Some(app)) = (&usage_log, &authenticated_app) {
+                        log.record_items(app, count, 0, count, 0);
+                    }
+                    return Ok(overloaded_response());
+                }
+            };
+            let worker_trace = trace.clone();
+            let deadline = Instant::now() + EXECUTION_TIMEOUT;
+            // Keep both permits inside the worker. Dropping the HTTP future
+            // cannot release work capacity while a blocking call is running.
+            tokio::task::spawn_blocking(move || {
+                let (reply, counts) = rpc.execute(body, &worker_trace, &permit, deadline);
+                if let (Some(log), Some(app)) = (&usage_log, &authenticated_app) {
+                    log.record_items(
+                        app,
+                        counts.attempted,
+                        counts.forwarded,
+                        counts.rejected,
+                        counts.lookups,
+                    );
+                }
+                let bytes = encode_reply(reply);
+                drop(permit);
+                AdmittedResponse {
+                    bytes,
+                    _permit: Some(body_permit),
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                // A worker panic cannot prove that a submitted mutation failed.
+                // Its permits have already unwound; this fallback is tiny.
+                AdmittedResponse {
+                    bytes: encode_reply(if is_batch {
+                        Value::Array(vec![rpc_reply(Err(unknown_backend_outcome())); count])
+                    } else {
+                        rpc_reply(Err(unknown_backend_outcome()))
+                    }),
+                    _permit: None,
+                }
             })
         }
     };
-
-    let response_body = match result {
-        Ok(res) => {
-            request_log!(
-                trace,
-                "request handler succeeded with JSON-RPC result: {res}"
-            );
-            json!({"result": res}).to_string()
-        }
-        Err(err) => {
-            request_log!(
-                trace,
-                "request handler returning JSON-RPC error: code={}, message={}",
-                err.code,
-                err.message
-            );
-            json!({"error": { "code": err.code, "message": err.message }}).to_string()
-        }
-    };
-    let mut response = Response::new(Body::from(response_body.clone()));
-
-    // Set the Referrer Policy header
+    request_log!(
+        trace,
+        "returning JSON response: bytes={}",
+        output.bytes.len()
+    );
+    let mut response = Response::new(Body::from(hyper::body::Bytes::from_owner(output)));
+    response.headers_mut().insert(
+        hyper::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
     response.headers_mut().insert(
         hyper::header::REFERRER_POLICY,
         "origin-when-cross-origin".parse().unwrap(),
     );
 
-    log_and_return_response(&trace, response, &response_body)
+    Ok(response)
 }
 
 fn log_and_return_response(
@@ -1343,11 +1731,10 @@ fn log_and_return_response(
 ) -> Result<Response<Body>, hyper::Error> {
     request_log!(
         trace,
-        "returning response: status={}, headers={}, body_bytes={}, body={}",
+        "returning response: status={}, headers={}, body_bytes={}",
         response.status(),
         headers_for_log(response.headers()),
-        body.len(),
-        body
+        body.len()
     );
     Ok(response)
 }
@@ -1378,7 +1765,8 @@ fn header_value_for_log(name: &str, value: &hyper::header::HeaderValue) -> Value
     }
 
     match value.to_str() {
-        Ok(value) => Value::String(value.to_string()),
+        Ok(value) if value.len() <= 256 => Value::String(value.to_string()),
+        Ok(value) => Value::String(format!("<omitted bytes={}>", value.len())),
         Err(_) => Value::String(format!("<non-utf8 bytes={}>", value.as_bytes().len())),
     }
 }

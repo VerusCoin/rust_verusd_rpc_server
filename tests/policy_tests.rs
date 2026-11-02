@@ -87,6 +87,39 @@ fn policy_loads_lists_from_conf_and_secrets() {
 }
 
 #[test]
+fn batching_defaults_on_and_honors_boolean_configuration() {
+    assert!(RequestPolicy::default().batching_enabled());
+    assert!(RequestPolicy::new(Vec::new(), Vec::new(), Vec::new())
+        .unwrap()
+        .batching_enabled());
+    let disabled = RequestPolicy::default().with_batching_enabled(false);
+    assert!(!disabled.batching_enabled());
+    assert!(disabled.with_batching_enabled(true).batching_enabled());
+
+    let secrets = config_from_toml("");
+    for (settings, expected) in [
+        ("", true),
+        ("batching_enabled = true", true),
+        ("batching_enabled = false", false),
+    ] {
+        let policy = RequestPolicy::from_config(&config_from_toml(settings), &secrets).unwrap();
+        assert_eq!(policy.batching_enabled(), expected, "{settings:?}");
+    }
+}
+
+#[test]
+fn batching_configuration_rejects_non_boolean_values() {
+    let secrets = config_from_toml("");
+    for value in ["'true'", "'false'", "0", "1", "1.0", "[]", "{}"] {
+        let settings = config_from_toml(&format!("batching_enabled = {value}"));
+        assert!(
+            RequestPolicy::from_config(&settings, &secrets).is_err(),
+            "batching_enabled must reject {value} instead of coercing it"
+        );
+    }
+}
+
+#[test]
 fn identity_name_resolution_defaults_off_and_rejects_invalid_configuration() {
     let secrets = config_from_toml(&format!("address_blocklist = [\"{BLOCKED_IADDR}\"]"));
     let missing =
