@@ -96,6 +96,26 @@ cargo build
 cargo run
 ```
 
+### Generating API keys
+
+With Node.js installed, run the helper from the repository root (no npm
+dependencies are required):
+
+```bash
+node scripts/generate-api-keys.js
+```
+
+This generates a random 32-byte, hex-encoded secret for each app ID listed in
+the script and writes TOML entries to `api-keys.txt` in the current directory.
+The file is ignored by Git and created with owner-only permissions (`0600`).
+Copy the needed entries under `[api_keys]` in `Secrets.toml`, and set
+`auth_enabled = true` in `Conf.toml`. The helper does not modify either
+configuration file.
+
+Use `--output <path>` to choose another destination. Existing files are
+preserved unless you pass `--force` to replace them. Keep generated secrets
+out of version control, including when using a custom output path.
+
 ### Deployment version
 
 Query `GET /version` on either listener to identify the running server release:

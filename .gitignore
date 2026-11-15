@@ -4,3 +4,4 @@
 .vscode
 .DS_Store
 Secrets.toml
+api-keys.txt
